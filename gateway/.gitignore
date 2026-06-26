@@ -1,0 +1,13 @@
+mosquitto/data
+mosquitto/log
+node-red/data/*
+.DS_Store
+.venv/
+certs/
+.env
+__pycache__/
+.pytest_cache/
+.coverage
+!node-red/data/flows/
+!node-red/data/flows/*.json
+docker-compose_local.yml

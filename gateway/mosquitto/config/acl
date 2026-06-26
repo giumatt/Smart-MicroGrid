@@ -1,0 +1,13 @@
+# Gateway components (internal, no certs)
+user trust_engine
+topic readwrite #
+
+user nodered
+topic readwrite #
+
+user blockchain
+topic read microgrid/transfers/#
+
+# Sensors with client certificates
+pattern readwrite microgrid/production
+pattern readwrite microgrid/production/%u

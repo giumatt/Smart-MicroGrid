@@ -1,0 +1,174 @@
+services:
+  # Broker MQTT (Mosquitto)
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: mqtt_broker
+    ports:
+      - "1883:1883"
+      - "8883:8883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+      - ./certs:/mosquitto/certs:ro
+    networks:
+      - microgrid_net
+    restart: unless-stopped
+
+  # InfluxDB
+  influxdb:
+    image: influxdb:2.7
+    container_name: smg_influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=smartgrid
+      - DOCKER_INFLUXDB_INIT_ORG=microgrid
+      - DOCKER_INFLUXDB_INIT_BUCKET=telemetry
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN= # Your InfluxDB token
+    volumes:
+      - influx_data:/var/lib/influxdb2
+      - influx_config:/etc/influxdb2
+    networks:
+      - microgrid_net
+    restart: unless-stopped
+
+  # Node-RED
+  nodered:
+    image: nodered/node-red:latest
+    container_name: node_red_ui
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./node-red/data:/data
+      - ./certs:/certs:ro
+    depends_on:
+      - mosquitto
+      - influxdb
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN= # Your InfluxDB token
+      - INFLUXDB_ORG=microgrid
+      - INFLUXDB_BUCKET=telemetry
+    networks:
+      - microgrid_net
+    restart: always
+
+  provisioner:
+    build:
+      context: ./src/provisioning
+    container_name: smg_provisioner
+    expose:
+      - "5000"
+    env_file:
+      - .env
+    volumes:
+      - ./certs:/app/certs:ro
+      - db_volume:/app/data
+    networks:
+      - microgrid_net
+    restart: unless-stopped
+
+  provisioner_nginx:
+    image: nginx:alpine
+    container_name: smg_provisioner_nginx
+    depends_on:
+      - provisioner
+    ports:
+      - "5001:443"
+    volumes:
+      - ./nginx/provisioner/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - microgrid_net
+    restart: always
+
+  # Trust Engine
+  trust_engine:
+    build:
+      context: ./src/trust_engine
+    container_name: smg_trust_engine
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    volumes:
+      - db_volume:/app/data
+      - ./certs:/app/certs:ro
+      - ./scripts:/app/src/scripts:ro
+    depends_on:
+      - mosquitto
+      - provisioner
+      - influxdb
+    networks:
+      - microgrid_net
+    restart: unless-stopped
+
+  # Blockchain Ledger Service
+  blockchain_service:
+    build:
+      context: ./src/blockchain
+    container_name: smg_blockchain
+    env_file:
+      - .env
+    expose:
+      - "8001"
+    environment:
+      - MQTT_TOPIC=${BLOCKCHAIN_MQTT_TOPIC:-microgrid/transfers}
+      - MQTT_TLS_CA_CERT=${BLOCKCHAIN_MQTT_TLS_CA_CERT:-/app/certs/ca.crt}
+      - MQTT_TLS_CERT=${BLOCKCHAIN_MQTT_TLS_CERT:-/app/certs/blockchain.crt}
+      - MQTT_TLS_KEY=${BLOCKCHAIN_MQTT_TLS_KEY:-/app/certs/blockchain.key}
+    volumes:
+      - db_volume:/app/data
+      - ./certs:/app/certs:ro
+    depends_on:
+      - mosquitto
+      - provisioner
+    networks:
+      - microgrid_net
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: smg_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - trust_engine
+      - blockchain_service
+      - provisioner
+    networks:
+      - microgrid_net
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: smg_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - microgrid_net
+    restart: always
+
+volumes:
+  db_volume:
+  influx_data:
+  influx_config:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  microgrid_net:
+    driver: bridge

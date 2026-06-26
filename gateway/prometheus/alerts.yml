@@ -1,0 +1,46 @@
+groups:
+  - name: microgrid-red
+    rules:
+      - alert: TrustEngineHighErrorRate
+        expr: |
+          sum(rate(te_validations_total{result="rejected"}[5m]))
+          /
+          clamp_min(sum(rate(te_messages_received_total[5m])), 1)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Trust Engine reject ratio > 5%
+          description: High rejection rate in Trust Engine telemetry validations.
+
+      - alert: TrustEngineHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(te_processing_seconds_bucket[5m])) by (le)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Trust Engine p95 processing latency > 1s
+          description: Trust Engine telemetry processing latency is elevated.
+
+      - alert: BlockchainRejectedSpike
+        expr: sum(rate(bc_rejected_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Blockchain rejects > 1/s
+          description: Many blockchain transfers are being rejected.
+
+      - alert: ProvisionerEnrollmentErrors
+        expr: sum(rate(prov_enrollment_results_total{result="rejected"}[10m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Provisioner enrollment errors > 0.2/s
+          description: Enrollment failures are increasing on the provisioner service.

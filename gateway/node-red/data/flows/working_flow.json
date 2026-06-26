@@ -1,0 +1,146 @@
+[
+    {
+        "id": "a1f54ac4ed8ebd35",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "d1416f42f559631e",
+        "type": "mqtt in",
+        "z": "a1f54ac4ed8ebd35",
+        "name": "",
+        "topic": "microgrid/production/#",
+        "qos": "2",
+        "datatype": "auto-detect",
+        "broker": "91554a06461e7824",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 220,
+        "y": 200,
+        "wires": [
+            [
+                "ab6d1cf85ea6a454",
+                "28592f19db50d967"
+            ]
+        ]
+    },
+    {
+        "id": "5b64a11771c862e3",
+        "type": "function",
+        "z": "a1f54ac4ed8ebd35",
+        "name": "function 1",
+        "func": "const rawPayload = msg.payload\nlet parsedPayload = rawPayload\n\nif (Buffer.isBuffer(parsedPayload)) {\n    parsedPayload = parsedPayload.toString('utf8')\n}\n\nif (typeof parsedPayload === 'string') {\n    try {\n        parsedPayload = JSON.parse(parsedPayload)\n    } catch (err) {\n        parsedPayload = parsedPayload\n    }\n}\n\nconst payload = (parsedPayload && typeof parsedPayload === 'object') ? parsedPayload : {}\nconst nodeId = payload.node_id ?? payload.nodeId ?? payload.device_id ?? payload.deviceId ?? payload.id\nconst production = payload.production ?? payload.power ?? payload.value\nconst rawTimestamp = payload.timestamp ?? payload.ts ?? payload.time ?? payload.datetime ?? payload.date\n\nlet readableTimestamp = null\nif (rawTimestamp !== undefined && rawTimestamp !== null) {\n    const numeric = Number(rawTimestamp)\n    if (!Number.isNaN(numeric)) {\n        const millis = numeric < 1e12 ? numeric * 1000 : numeric\n        readableTimestamp = new Date(millis).toLocaleString()\n    } else if (typeof rawTimestamp === 'string') {\n        const parsed = new Date(rawTimestamp)\n        if (!Number.isNaN(parsed.getTime())) {\n            readableTimestamp = parsed.toLocaleString()\n        }\n    }\n}\n\nmsg.payload = {\n    node_id: nodeId,\n    production: production,\n    timestamp: readableTimestamp,\n    topic: msg.topic\n}\n\nreturn msg",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 600,
+        "y": 200,
+        "wires": [
+            [
+                "5eaacffad5b66f08"
+            ]
+        ]
+    },
+    {
+        "id": "ab6d1cf85ea6a454",
+        "type": "json",
+        "z": "a1f54ac4ed8ebd35",
+        "name": "",
+        "property": "payload",
+        "action": "",
+        "pretty": false,
+        "x": 430,
+        "y": 200,
+        "wires": [
+            [
+                "5b64a11771c862e3"
+            ]
+        ]
+    },
+    {
+        "id": "5eaacffad5b66f08",
+        "type": "debug",
+        "z": "a1f54ac4ed8ebd35",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 820,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "28592f19db50d967",
+        "type": "debug",
+        "z": "a1f54ac4ed8ebd35",
+        "name": "debug 2",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 400,
+        "y": 320,
+        "wires": []
+    },
+    {
+        "id": "91554a06461e7824",
+        "type": "mqtt-broker",
+        "name": "Clients",
+        "broker": "mosquitto",
+        "port": "8883",
+        "tls": "bbc4e77fc3d35742",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": true,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "bbc4e77fc3d35742",
+        "type": "tls-config",
+        "name": "",
+        "cert": "",
+        "key": "",
+        "ca": "",
+        "certname": "nodered.crt",
+        "keyname": "nodered.key",
+        "caname": "ca.crt",
+        "servername": "",
+        "verifyservercert": true,
+        "alpnprotocol": ""
+    }
+]

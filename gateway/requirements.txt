@@ -1,0 +1,8 @@
+paho-mqtt
+cryptography
+pandas
+numpy
+flask
+influxdb-client
+pytest
+pytest-cov

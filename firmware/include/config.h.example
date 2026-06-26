@@ -1,0 +1,130 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// ============================================================================
+// SMART MICROGRID - ESP32 CONFIGURATION
+// ============================================================================
+
+// --- Network Parameters ---
+const char* const WIFI_SSID = "YOUR_WIFI_SSID";             // Your Wi-Fi network name
+const char* const WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";     // Your Wi-Fi network password
+
+// --- MQTT Parameters (Raspberry Pi Gateway) ---
+const char* const MQTT_BROKER = "192.168.1.100";            // IP address of the MQTT broker
+const char* const MQTT_CLIENT_ID = "SmartMeter_ESP";        // Unique identifier for this MQTT client
+const char* const MQTT_TOPIC = "microgrid/production";      // Topic to publish energy production data
+
+// MQTT Port: conditionally defined based on the build flag
+#ifndef MQTT_PORT
+    #if defined(ALLOW_INSECURE_MQTT) && ALLOW_INSECURE_MQTT == 1
+        #define MQTT_PORT 1883                              // Development: no TLS
+    #else
+        #define MQTT_PORT 8883                              // Production: TLS
+    #endif
+#endif
+
+// --- Provisioning Server ---
+const char* const PROVISIONING_URL = "https://192.168.1.100:5001/enroll"; // URL for device certificate enrollment
+#ifndef MAX_PROVISIONING_RETRIES
+    #define MAX_PROVISIONING_RETRIES 3                      // Maximum number of attempts to enroll the device
+#endif
+
+// --- Timing ---
+// SEND_INTERVAL_MS is defined in platformio.ini, but has a default fallback here
+#ifndef SEND_INTERVAL_MS
+    #define SEND_INTERVAL_MS 2000                           // Default delay between MQTT publishes in milliseconds
+#endif
+
+// --- NTP Parameters ---
+const char* const NTP_SERVER = "pool.ntp.org";              // Network Time Protocol server for time synchronization
+const long GMT_OFFSET_SEC = 3600;                           // UTC+1 (Italy) timezone offset in seconds
+const int DAYLIGHT_OFFSET_SEC = 3600;                       // Daylight Saving Time (DST) offset in seconds
+
+// --- Sensor Simulation Parameters ---
+const float MAX_NOMINAL_POWER = 3000.0;                     // 3kW peak nominal power capacity
+const int PIN_VOLTAGE = 34;                                 // ADC Pin for reading voltage
+const int PIN_CURRENT = 35;                                 // ADC Pin for reading current
+
+// --- Forecast Simulation Parameters (SIMULATION_MODE) ---
+#ifndef USE_FORECAST_API
+    #define USE_FORECAST_API 1                              // Flag to enable (1) or disable (0) the Open-Meteo forecast API
+#endif
+
+#ifndef FORECAST_API_URL
+    #define FORECAST_API_URL "https://api.open-meteo.com/v1/forecast" // Base URL for the weather forecast API
+#endif
+
+#ifndef FORECAST_LATITUDE
+    #define FORECAST_LATITUDE 38.3125                       // Default latitude for weather forecast (e.g., Italy)
+#endif
+
+#ifndef FORECAST_LONGITUDE
+    #define FORECAST_LONGITUDE 16.0                         // Default longitude for weather forecast
+#endif
+
+#ifndef FORECAST_CACHE_SECONDS
+    #define FORECAST_CACHE_SECONDS 1800                     // Time-To-Live (TTL) for cached weather data in seconds (30 mins)
+#endif
+
+#ifndef FORECAST_TIMEOUT_MS
+    #define FORECAST_TIMEOUT_MS 10000                       // Timeout for the forecast API request in milliseconds
+#endif
+
+#ifndef FALLBACK_SUNRISE_HOUR
+    #define FALLBACK_SUNRISE_HOUR 6.0f                      // Mathematical fallback sunrise hour (local decimal time)
+#endif
+
+#ifndef FALLBACK_SUNSET_HOUR
+    #define FALLBACK_SUNSET_HOUR 18.0f                      // Mathematical fallback sunset hour (local decimal time)
+#endif
+
+#ifndef FALLBACK_PEAK_IRRADIANCE_WM2
+    #define FALLBACK_PEAK_IRRADIANCE_WM2 1000.0f            // Mathematical fallback peak solar irradiance in Watts per square meter
+#endif
+
+#ifndef FORECAST_NOISE_STDDEV
+    #define FORECAST_NOISE_STDDEV 0.01f                     // Standard deviation for simulated measurement noise
+#endif
+
+// --- Forecast API CA Certificate (Production) ---
+// Required when SKIP_CERT_VERIFICATION=0 to validate Open-Meteo TLS.
+// Source: https://letsencrypt.org/certs/isrgrootx1.pem.txt
+#ifndef FORECAST_CA_CERT
+    static const char FORECAST_CA_CERT_VALUE[] =
+        "-----BEGIN CERTIFICATE-----\n"
+        <SNIP>
+        "-----END CERTIFICATE-----\n";
+    #define FORECAST_CA_CERT FORECAST_CA_CERT_VALUE
+#endif
+
+// --- Debug Helpers ---
+#ifndef DEBUG_MODE
+    #define DEBUG_MODE 0                                    // Toggle debug logging output over Serial
+#endif
+
+#ifndef SIMULATION_MODE
+    #define SIMULATION_MODE 1                               // Toggle sensor simulation versus actual hardware readings
+#endif
+
+// --- Logging Macro ---
+#if DEBUG_MODE
+    #define DEBUG_PRINT(x)    Serial.print(x)
+    #define DEBUG_PRINTLN(x)  Serial.println(x)
+    #define DEBUG_PRINTF(... ) Serial.printf(__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(x)
+    #define DEBUG_PRINTLN(x)
+    #define DEBUG_PRINTF(...)
+#endif
+
+// --- Root CA Certificate (Production only) ---
+// Paste the content of gateway/certs/ca.crt here
+#if !defined(SKIP_CERT_VERIFICATION) || SKIP_CERT_VERIFICATION == 0
+const char* const CA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+INSERT_CA_CERTIFICATE_HERE
+-----END CERTIFICATE-----
+)EOF";
+#endif
+
+#endif // CONFIG_H

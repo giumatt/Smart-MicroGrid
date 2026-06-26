@@ -1,0 +1,89 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// ============================================================================
+// SMART MICROGRID - ESP32 CONFIGURATION
+// ============================================================================
+// Copia questo file come "config.h" e modifica i valori
+// ============================================================================
+
+// --- Network Parameters ---
+const char* const WIFI_SSID = "POCO Pad";
+const char* const WIFI_PASSWORD = "Mattia*99";
+
+// --- MQTT Parameters (Raspberry Pi Gateway) ---
+const char* const MQTT_BROKER = "10.228.187.118";
+const char* const MQTT_CLIENT_ID = "SmartMeter_001";
+const char* const MQTT_TOPIC = "microgrid/production";
+
+// Porta MQTT:  definita condizionalmente in base al build flag
+#ifndef MQTT_PORT
+    #if defined(ALLOW_INSECURE_MQTT) && ALLOW_INSECURE_MQTT == 1
+        #define MQTT_PORT 1883      // Development:  no TLS
+    #else
+        #define MQTT_PORT 8883      // Production: TLS
+    #endif
+#endif
+
+// --- Provisioning Server ---
+const char* const PROVISIONING_URL = "https://10.228.187.118:5001/enroll";
+
+#ifndef MAX_PROVISIONING_RETRIES
+    #define MAX_PROVISIONING_RETRIES 3
+#endif
+
+// --- Timing ---
+// SEND_INTERVAL_MS è definito in platformio.ini, ma ha un default
+#ifndef SEND_INTERVAL_MS
+    #define SEND_INTERVAL_MS 2000
+#endif
+
+// --- NTP Parameters ---
+const char* const NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 3600;       // UTC+1 (Italy)
+const int DAYLIGHT_OFFSET_SEC = 3600;   // DST
+
+// --- Sensor Simulation Parameters ---
+const float MAX_NOMINAL_POWER = 3000.0; // 3kW peak
+const int PIN_VOLTAGE = 34;             // ADC Pin for voltage
+const int PIN_CURRENT = 35;             // ADC Pin for current
+
+// --- Debug Helpers ---
+#ifndef DEBUG_MODE
+    #define DEBUG_MODE 0
+#endif
+
+#ifndef SIMULATION_MODE
+    #define SIMULATION_MODE 1
+#endif
+
+// --- Logging Macro ---
+#if DEBUG_MODE
+    #define DEBUG_PRINT(x)    Serial.print(x)
+    #define DEBUG_PRINTLN(x)  Serial.println(x)
+    #define DEBUG_PRINTF(... ) Serial.printf(__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(x)
+    #define DEBUG_PRINTLN(x)
+    #define DEBUG_PRINTF(...)
+#endif
+
+// --- Root CA Certificate (Production only) ---
+// Incolla qui il contenuto di gateway/certs/ca.crt
+#if !defined(SKIP_CERT_VERIFICATION) || SKIP_CERT_VERIFICATION == 0
+const char* const CA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIBqTCCAU+gAwIBAgIUU4IA/Sd8Za1QWn0XMSHsryclUzswCgYIKoZIzj0EAwIw
+SjEfMB0GA1UEAwwWU21hcnRNaWNyb0dyaWQtUm9vdC1DQTEaMBgGA1UECgwRVHJ1
+c3RlZC1NaWNyb0dyaWQxCzAJBgNVBAYTAklUMB4XDTI2MDMyNTE2NDY1NVoXDTM2
+MDMyMjE2NDY1NVowSjEfMB0GA1UEAwwWU21hcnRNaWNyb0dyaWQtUm9vdC1DQTEa
+MBgGA1UECgwRVHJ1c3RlZC1NaWNyb0dyaWQxCzAJBgNVBAYTAklUMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEEGyNdzUtSw2g08bam5I6wUia9phm5S+x8jX2HLB+
+78hS+ikslcejZoT3GYlLIk0mzn/Pl51L7k+oH5eQisjYOaMTMBEwDwYDVR0TAQH/
+BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEAjW+FPmhI1VKZzywgbwbm04bNxLEK
+hNcg9Rmqy8ZB034CICHr57PPTb6iIfDZqoObmFCWhZuQhpHmzB8SE5nmNu+t
+-----END CERTIFICATE-----
+)EOF";
+#endif
+
+#endif // CONFIG_H
