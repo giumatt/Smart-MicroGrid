@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
+
 """
 Asynchronous simulator of an ESP32 swarm for Smart MicroGrid.
-
 Key features:
 - One asyncio task per device (no threads or multiprocessing).
-- HTTPS enrollment with the provisioner using a CSR to obtain a device certificate.
+- HTTPS enrollment with the provisioner using a CSR to obtain a device certificate (Bootstrap Token secured).
 - MQTT connection on port 8883 with mTLS for each device.
 - Photovoltaic telemetry synchronized with Open-Meteo (or gateway-compatible mathematical fallback).
 - Payload signing:
@@ -13,7 +13,6 @@ Key features:
 - Mandatory jitter on every sleep to prevent synchronized bursts.
 - Graceful shutdown on SIGINT/SIGTERM.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -28,6 +27,7 @@ import os
 import random
 import signal
 import ssl
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -51,30 +51,25 @@ class SimulationConfig:
     enroll_ca_file: Path
     allow_insecure_enroll: bool
     relax_x509_strict_tls: bool
-
     mqtt_host: str
     mqtt_port: int
     mqtt_topic: str
-
+    mqtt_blocks_topic: str
     publish_interval_seconds: float
     jitter_ratio: float
     reconnect_delay_seconds: float
     initial_stagger_seconds: float
-
     enrollment_timeout_seconds: float
     enrollment_retry_delay_seconds: float
-
     forecast_api_url: str
     forecast_latitude: float
     forecast_longitude: float
     forecast_cache_seconds: float
     forecast_timeout_seconds: float
     use_forecast_api: bool
-
     fallback_sunrise_hour: float
     fallback_sunset_hour: float
     fallback_peak_irradiance_wm2: float
-
     runtime_dir: Path
 
 @dataclass(slots=True)
@@ -82,6 +77,8 @@ class DeviceRuntimeState:
     """Runtime state specific to a single device."""
     # Static parameter to ensure that devices are not identical while maintaining shared weather data.
     nominal_peak_watt: float
+    latest_block_hash: str = "0x0000000000000000000000000000000000000000000000000000000000000000"
+    latest_block_number: int = 0
 
 @dataclass(slots=True)
 class WeatherRuntimeState:
@@ -102,7 +99,6 @@ class SwarmWeatherService:
     async def get_yield_percentage(self, now_ts: int) -> float:
         """Fetch or calculate the current yield percentage based on the cache or an API call."""
         now_monotonic = time.monotonic()
-
         # Return cached value if it is still valid
         if self._is_cache_fresh(now_monotonic):
             return float(self.state.cached_yield_percentage)
@@ -146,7 +142,6 @@ class SwarmWeatherService:
             "longitude": self.config.forecast_longitude,
             "current": "shortwave_radiation",
         }
-
         async with self.http_session.get(
             self.config.forecast_api_url,
             params=params,
@@ -190,7 +185,6 @@ class SwarmWeatherService:
 
 class SimulatedDevice:
     """Represents a single simulated ESP32 with independent state."""
-
     def __init__(
         self,
         device_id: str,
@@ -209,7 +203,6 @@ class SimulatedDevice:
         self.device_cert_pem: str | None = None
         self.ca_cert_pem: str | None = None
         self.hmac_key: bytes | None = None
-
         self.runtime_paths = self._build_runtime_paths()
 
         self.state = DeviceRuntimeState(
@@ -250,12 +243,13 @@ class SimulatedDevice:
         """Perform a single HTTP request to enroll the device with the provisioner."""
         if self.private_key is None:
             self.private_key = ec.generate_private_key(ec.SECP256R1())
-
         csr_pem = self._build_csr_pem(self.private_key)
+
         payload = {
             "device_id": self.device_id,
             "csr": csr_pem,
             "peak_power": int(round(self.state.nominal_peak_watt)),
+            "bootstrap_token": f"token-{self.device_id}"  # <-- INIEZIONE TOKEN
         }
 
         request_ssl = self._build_enrollment_ssl_context()
@@ -268,12 +262,10 @@ class SimulatedDevice:
                 ssl=request_ssl,
             ) as response:
                 body = await response.text()
-
                 if response.status >= 500:
                     raise RuntimeError(f"gateway 5xx during enrollment: {response.status}")
                 if response.status >= 400:
                     raise RuntimeError(f"gateway 4xx during enrollment: {response.status} {body[:180]}")
-
                 data = json.loads(body)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("enrollment timeout") from exc
@@ -282,6 +274,7 @@ class SimulatedDevice:
 
         certificate = data.get("certificate")
         ca_certificate = data.get("ca_certificate")
+
         if not isinstance(certificate, str) or not certificate.strip():
             raise RuntimeError("enrollment response missing certificate")
         if not isinstance(ca_certificate, str) or not ca_certificate.strip():
@@ -305,44 +298,55 @@ class SimulatedDevice:
             try:
                 async with aiomqtt.Client(**self._build_mqtt_client_kwargs()) as mqtt_client:
                     LOGGER.info("[%s] Connected to MQTT %s:%s", self.device_id, self.config.mqtt_host, self.config.mqtt_port)
-                    publish_count = 0
+                    
+                    await mqtt_client.subscribe(self.config.mqtt_blocks_topic)
+                    listen_task = asyncio.create_task(self._listen_for_blocks(mqtt_client))
+                    
+                    try:
+                        publish_count = 0
+                        seq_counter = 1
 
-                    while not self.stop_event.is_set():
-                        base_payload = await self._build_telemetry_payload()
-                        signature = self._sign_payload(base_payload)
-                        full_payload = {
-                            "node_id": base_payload["node_id"],
-                            "timestamp": base_payload["timestamp"],
-                            "production": base_payload["production"],
-                            "sig": signature,
-                        }
+                        while not self.stop_event.is_set():
+                            base_payload = await self._build_telemetry_payload(seq_counter)
+                            signature = self._sign_payload(base_payload)
+                            
+                            full_payload = {
+                                "node_id": base_payload["node_id"],
+                                "timestamp": base_payload["timestamp"],
+                                "seq": base_payload["seq"],
+                                "production": base_payload["production"],
+                                "sig": signature,
+                            }
+                            
+                            mqtt_json = json.dumps(full_payload, separators=(",", ":"), ensure_ascii=True)
+                            publish_timeout = max(5.0, min(30.0, self.config.publish_interval_seconds))
+                            
+                            await asyncio.wait_for(
+                                mqtt_client.publish(self.config.mqtt_topic, mqtt_json, qos=0, retain=False),
+                                timeout=publish_timeout,
+                            )
 
-                        mqtt_json = json.dumps(full_payload, separators=(",", ":"), ensure_ascii=True)
-                        publish_timeout = max(5.0, min(30.0, self.config.publish_interval_seconds))
-                        
-                        await asyncio.wait_for(
-                            mqtt_client.publish(self.config.mqtt_topic, mqtt_json, qos=0, retain=False),
-                            timeout=publish_timeout,
-                        )
-                        publish_count += 1
+                            publish_count += 1
+                            seq_counter += 1
 
-                        if publish_count == 1:
+                            if publish_count == 1:
+                                LOGGER.info(
+                                    "[%s] First telemetry published to %s (production=%.2fW)",
+                                    self.device_id,
+                                    self.config.mqtt_topic,
+                                    float(base_payload["production"]),
+                                )
                             LOGGER.info(
-                                "[%s] First telemetry published to %s (production=%.2fW)",
+                                "[%s] TX topic=%s production=%.2fW sig=%s...",
                                 self.device_id,
                                 self.config.mqtt_topic,
                                 float(base_payload["production"]),
+                                signature[:8],
                             )
 
-                        LOGGER.info(
-                            "[%s] TX topic=%s production=%.2fW sig=%s...",
-                            self.device_id,
-                            self.config.mqtt_topic,
-                            float(base_payload["production"]),
-                            signature[:8],
-                        )
-
-                        await self._sleep_with_jitter(self.config.publish_interval_seconds)
+                            await self._sleep_with_jitter(self.config.publish_interval_seconds)
+                    finally:
+                        listen_task.cancel()
 
             except asyncio.CancelledError:
                 raise
@@ -350,7 +354,7 @@ class SimulatedDevice:
                 LOGGER.warning("[%s] MQTT error/timeout: %s", self.device_id, exc)
                 await self._sleep_with_jitter(self.config.reconnect_delay_seconds)
 
-    async def _build_telemetry_payload(self) -> dict[str, Any]:
+    async def _build_telemetry_payload(self, seq_counter: int) -> dict[str, Any]:
         """Construct the un-signed telemetry payload."""
         now_ts = int(time.time())
         yield_percentage = await self.weather_service.get_yield_percentage(now_ts)
@@ -367,6 +371,7 @@ class SimulatedDevice:
         return {
             "node_id": self.device_id,
             "timestamp": now_ts,
+            "seq": seq_counter,
             "production": float(f"{production_watt:.2f}"),
         }
 
@@ -464,11 +469,8 @@ class SimulatedDevice:
 
     def _maybe_relax_x509_strict(self, context: ssl.SSLContext) -> None:
         """Optionally relax strict TLS certificate checking policies."""
-        # Recent OpenSSL versions (e.g., with Python 3.14) can reject dev certificates
-        # without AKI/SKI when VERIFY_X509_STRICT is active.
         if not self.config.relax_x509_strict_tls:
             return
-
         strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
         if strict_flag:
             context.verify_flags &= ~strict_flag
@@ -477,7 +479,6 @@ class SimulatedDevice:
         """Sleep for a given amount of time plus or minus a randomized jitter."""
         if base_seconds <= 0:
             return
-
         jitter = base_seconds * self.config.jitter_ratio
         delay = random.uniform(base_seconds - jitter, base_seconds + jitter)
         delay = max(0.05, delay)
@@ -493,17 +494,14 @@ class SimulatedDevice:
             raise RuntimeError("Incomplete TLS material")
 
         self.runtime_paths["dir"].mkdir(parents=True, exist_ok=True)
-
         key_pem = self.private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
-
         self.runtime_paths["key"].write_bytes(key_pem)
         self.runtime_paths["cert"].write_text(self.device_cert_pem, encoding="utf-8")
         self.runtime_paths["ca"].write_text(self.ca_cert_pem, encoding="utf-8")
-
         os.chmod(self.runtime_paths["key"], 0o600)
 
     def _build_runtime_paths(self) -> dict[str, Path]:
@@ -526,16 +524,74 @@ class SimulatedDevice:
         """Convert an incoming HMAC key string into bytes appropriately."""
         value = hmac_value.strip()
         try:
-            # Hexadecimal attempt (common in IoT backends).
             return bytes.fromhex(value)
         except ValueError:
             return value.encode("utf-8")
+        
+    async def _listen_for_blocks(self, mqtt_client: aiomqtt.Client) -> None:
+        """Asynchronously listen for new block hashes from the Gateway."""
+        try:
+            async for message in mqtt_client.messages:
+                if str(message.topic) == self.config.mqtt_blocks_topic:
+                    payload = json.loads(message.payload.decode())
+                    
+                    self.state.latest_block_hash = payload.get("blockHash", "")
+                    self.state.latest_block_number = payload.get("blockNumber", 0)
+                    latest_tx_node = payload.get("latestTxNode", "")
+                    
+                    LOGGER.debug(
+                        "[%s] Blockchain Sync! Blocco #%d | Hash: %s... | Tx di: %s",
+                        self.device_id,
+                        self.state.latest_block_number,
+                        self.state.latest_block_hash[:10],
+                        latest_tx_node
+                    )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("[%s] Error receiving block: %s", self.device_id, exc)
 
 
 def build_device_id(index: int) -> str:
-    """Generate a unique ID for a simulated device."""
-    # Readable and unique format for high-volume testing.
-    return f"SmartMeter_{index:04d}_{uuid.uuid4().hex[:8]}"
+    """Generate a deterministic ID for a simulated device."""
+    # Rimosso lo UUID casuale per permettere il pre-seeding deterministico dei token in SQLite.
+    return f"SimMeter_{index:04d}"
+
+
+def seed_simulator_tokens(device_ids: list[str]) -> None:
+    """
+    Automatically injects the required bootstrap tokens into the Provisioner's SQLite database
+    running inside the Docker container. This ensures the simulator can seamlessly enroll
+    without Identity Hijacking defenses blocking the nodes.
+    """
+    LOGGER.info("Seeding bootstrap tokens into the Provisioner database via Docker...")
+    
+    tokens_data = [(f"token-{did}", did) for did in device_ids]
+    
+    py_script = (
+        "import sqlite3; "
+        "conn = sqlite3.connect('/app/data/gateway.db'); "
+        "c = conn.cursor(); "
+        "c.execute('CREATE TABLE IF NOT EXISTS bootstrap_tokens (token TEXT PRIMARY KEY, node_id TEXT, used INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)'); "
+        f"c.executemany('INSERT OR IGNORE INTO bootstrap_tokens (token, node_id) VALUES (?, ?)', {tokens_data}); "
+        "conn.commit(); "
+        "conn.close();"
+    )
+    
+    try:
+        subprocess.run(
+            ["docker", "exec", "smg_provisioner", "python", "-c", py_script],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        LOGGER.info("Tokens seeded successfully.")
+    except subprocess.CalledProcessError as e:
+        LOGGER.warning("Could not automatically seed tokens. Docker exec failed: %s", e.stderr.strip())
+    except FileNotFoundError:
+        LOGGER.warning("Docker CLI not found. Tokens must be manually seeded if running remotely.")
+    except Exception as e:
+        LOGGER.warning("Failed to run docker exec: %s", e)
 
 
 def install_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -545,7 +601,6 @@ def install_signal_handlers(stop_event: asyncio.Event) -> None:
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except (NotImplementedError, RuntimeError):
-            # Some environments do not allow custom handlers (e.g., Windows or non-main loop).
             pass
 
 
@@ -556,9 +611,15 @@ async def run_swarm(config: SimulationConfig, device_count: int) -> None:
     stop_event = asyncio.Event()
     install_signal_handlers(stop_event)
 
+    # 1. Building deterministic IDs
+    device_ids = [build_device_id(i + 1) for i in range(device_count)]
+
+    # 2. Inserting tokens in SQLite DB
+    seed_simulator_tokens(device_ids)
+
     connector = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=config.enrollment_timeout_seconds)
-
+    
     LOGGER.info(
         "Starting simulation: devices=%d enroll=%s mqtt=%s:%d topic=%s interval=%.1fs jitter=%.0f%% weather=%s(%.4f,%.4f)",
         device_count,
@@ -575,16 +636,15 @@ async def run_swarm(config: SimulationConfig, device_count: int) -> None:
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         weather_service = SwarmWeatherService(config=config, http_session=session)
-
         devices = [
             SimulatedDevice(
-                device_id=build_device_id(i + 1),
+                device_id=did,
                 config=config,
                 weather_service=weather_service,
                 stop_event=stop_event,
                 http_session=session,
             )
-            for i in range(device_count)
+            for did in device_ids
         ]
 
         tasks = [asyncio.create_task(device.run(), name=device.device_id) for device in devices]
@@ -594,15 +654,12 @@ async def run_swarm(config: SimulationConfig, device_count: int) -> None:
         finally:
             stop_event.set()
             LOGGER.info("Shutdown requested, waiting for tasks to terminate...")
-
             done, pending = await asyncio.wait(tasks, timeout=20.0)
             if pending:
                 LOGGER.warning("Tasks did not terminate in time: %d. Forcibly canceling.", len(pending))
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-
-            # 'done' is read only to drain any potential exceptions
             await asyncio.gather(*done, return_exceptions=True)
 
 
@@ -620,7 +677,6 @@ async def async_main() -> None:
     def pick(name: str, cli_value: Any, caster: Any = str) -> Any:
         if cli_value is not None:
             return cli_value
-
         value = env_value(name)
         if value is None:
             raise ValueError(f"Missing configuration: set {name} in the .env file or via CLI")
@@ -650,6 +706,7 @@ async def async_main() -> None:
     parser.add_argument("--mqtt-host", type=str, default=None, help="MQTT broker host")
     parser.add_argument("--mqtt-port", type=int, default=None, help="MQTT broker port")
     parser.add_argument("--mqtt-topic", type=str, default=None, help="MQTT topic")
+    parser.add_argument("--mqtt-blocks-topic", type=str, default=None, help="MQTT blocks topic for SPV sync")
     parser.add_argument("--interval", type=float, default=None, help="Base publish interval in seconds")
     parser.add_argument("--jitter", type=float, default=None, help="Relative jitter (0.10 = +/-10%%)")
     parser.add_argument("--forecast-lat", type=float, default=None, help="Latitude for Open-Meteo")
@@ -703,6 +760,7 @@ async def async_main() -> None:
         mqtt_host=pick("SWARM_MQTT_HOST", args.mqtt_host, str),
         mqtt_port=pick("SWARM_MQTT_PORT", args.mqtt_port, int),
         mqtt_topic=pick("SWARM_MQTT_TOPIC", args.mqtt_topic, str),
+        mqtt_blocks_topic=(args.mqtt_blocks_topic or env_value("SWARM_MQTT_BLOCKS_TOPIC") or "microgrid/blocks/latest"),
         publish_interval_seconds=pick("SWARM_INTERVAL_SECONDS", args.interval, float),
         jitter_ratio=pick("SWARM_JITTER_RATIO", args.jitter, float),
         reconnect_delay_seconds=pick("SWARM_RECONNECT_DELAY_SECONDS", None, float),
@@ -723,11 +781,8 @@ async def async_main() -> None:
 
     await run_swarm(config=config, device_count=device_count)
 
-
 if __name__ == "__main__":
-    # Configured for 100 parallel devices (override with --devices).
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
-        # Fallback in environments where the loop's signal handler is unavailable.
         LOGGER.info("Interrupted by keyboard")
