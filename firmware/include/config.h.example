@@ -13,6 +13,7 @@ const char* const WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";     // Your Wi-Fi networ
 const char* const MQTT_BROKER = "192.168.1.100";            // IP address of the MQTT broker
 const char* const MQTT_CLIENT_ID = "SmartMeter_ESP";        // Unique identifier for this MQTT client
 const char* const MQTT_TOPIC = "microgrid/production";      // Topic to publish energy production data
+const char* const MQTT_BLOCKS_TOPIC = "microgrid/blocks/latest";    // Topic for Blockchain lightweight node
 
 // MQTT Port: conditionally defined based on the build flag
 #ifndef MQTT_PORT
@@ -28,6 +29,9 @@ const char* const PROVISIONING_URL = "https://192.168.1.100:5001/enroll"; // URL
 #ifndef MAX_PROVISIONING_RETRIES
     #define MAX_PROVISIONING_RETRIES 3                      // Maximum number of attempts to enroll the device
 #endif
+
+// --- Provisioning Security ---
+const char* const BOOTSTRAP_TOKEN = "token-ESP";
 
 // --- Timing ---
 // SEND_INTERVAL_MS is defined in platformio.ini, but has a default fallback here
