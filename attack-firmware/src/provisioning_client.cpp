@@ -138,9 +138,8 @@ bool performProvisioning(const char* device_id, const char* server_url) {
     JsonDocument doc;
     doc["device_id"] = device_id;
     doc["csr"]       = csr;
-
-    // (TODO Firmware) Send peak_power to the enrollment server
     doc["peak_power"] = MAX_NOMINAL_POWER;
+    doc["bootstrap_token"] = BOOTSTRAP_TOKEN;
 
     String jsonPayload;
     serializeJson(doc, jsonPayload);
