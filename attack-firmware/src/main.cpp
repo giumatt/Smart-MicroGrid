@@ -180,6 +180,7 @@ void loop() {
             JsonDocument doc;
             doc["node_id"] = MQTT_CLIENT_ID;
             doc["timestamp"] = data.timestamp;
+            doc["seq"] = getNextSequence();
             doc["production"]  = serialized(String(data.power, 2));    // raw number with 2 decimals
 
             // D. Digital Signature (Integrity & Non-Repudiation)
