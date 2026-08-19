@@ -245,6 +245,25 @@ String getPublicKeyHex() {
     return hex;
 }
 
+uint32_t getNextSequence() {
+    nvs_handle_t handle;
+    uint32_t seq = 0;
+
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        Serial.println("[SECURITY] NVS open failed for sequence counter");
+        return 0;
+    }
+
+    nvs_get_u32(handle, SEQ_TAG, &seq);   // if doesn't exists stays 0
+    seq += 1;
+    nvs_set_u32(handle, SEQ_TAG, seq);
+    nvs_commit(handle);
+    nvs_close(handle);
+
+    return seq;
+}
+
 // ============================================================================
 // CSR generation
 // ============================================================================
