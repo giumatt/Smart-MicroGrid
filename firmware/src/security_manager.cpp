@@ -17,6 +17,7 @@ static const char* NVS_NAMESPACE = "iot_secure";
 static const char* KEY_TAG      = "ecdsa_priv";  // PEM
 static const char* CERT_TAG     = "x509_cert";   // PEM
 static const char* CA_CERT_TAG  = "ca_cert";     // PEM
+static const char* SEQ_TAG = "seq_counter";
 
 // ============================================================================
 // Global Contexts
@@ -243,6 +244,25 @@ String getPublicKeyHex() {
     String hex; hex.reserve(len*2);
     for (size_t i=0;i<len;i++){ char h[3]; snprintf(h,3,"%02x",start[i]); hex+=h; }
     return hex;
+}
+
+uint32_t getNextSequence() {
+    nvs_handle_t handle;
+    uint32_t seq = 0;
+
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        Serial.println("[SECURITY] NVS open failed for sequence counter");
+        return 0;
+    }
+
+    nvs_get_u32(handle, SEQ_TAG, &seq);   // if doesn't exists stays 0
+    seq += 1;
+    nvs_set_u32(handle, SEQ_TAG, seq);
+    nvs_commit(handle);
+    nvs_close(handle);
+
+    return seq;
 }
 
 // ============================================================================
