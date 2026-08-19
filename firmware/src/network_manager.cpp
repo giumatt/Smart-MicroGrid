@@ -39,6 +39,35 @@ static PubSubClient mqttClient(netClient);
 static void initTime();
 static bool waitForTimeSync(int timeout_sec);
 
+// Blockchain State Variables 
+static String latestBlockHash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+static uint32_t latestBlockNumber = 0;
+
+String getLatestBlockHash() {
+    return latestBlockHash;
+}
+
+// --- Callback for receiving MQTT messages ---
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic, MQTT_BLOCKS_TOPIC) == 0) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, payload, length);
+        
+        if (!error) {
+            latestBlockHash = doc["blockHash"].as<String>();
+            latestBlockNumber = doc["blockNumber"].as<uint32_t>();
+            String latestTxNode = doc["latestTxNode"].as<String>();
+            
+            DEBUG_PRINTF("[BLOCKCHAIN] Sync! Blocco #%d | Hash: %s... | Tx di: %s\n", 
+                         latestBlockNumber, 
+                         latestBlockHash.substring(0, 10).c_str(),
+                         latestTxNode.c_str());
+        } else {
+            DEBUG_PRINTLN("[BLOCKCHAIN] Errore nel parsing del blocco JSON.");
+        }
+    }
+}
+
 // WiFi & Time Initialization
 void initNetwork() {
     Serial.println("[NET] Connecting to Wi-Fi...");
@@ -118,6 +147,7 @@ void initMQTT() {
 
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setBufferSize(1024);
+    mqttClient.setCallback(mqttCallback);
     Serial.printf("[MQTT] Broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
 
 #if USING_TLS
@@ -142,6 +172,7 @@ void maintainLink() {
         bool connected = mqttClient.connect(MQTT_CLIENT_ID);
         if (connected) {
             Serial.println("Connected!");
+            mqttClient.subscribe(MQTT_BLOCKS_TOPIC);
         } else {
             Serial.print("Failed, rc=");
             Serial.print(mqttClient.state());
