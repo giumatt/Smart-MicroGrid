@@ -22,5 +22,6 @@ bool isProvisioned();
 const char* getDeviceCert();  // PEM
 const char* getDeviceKey();   // PEM
 const char* getCACert();      // PEM (NVS or embedded)
+uint32_t getNextSequence();   // Anti-replay sequence
 
 #endif // SECURITY_MANAGER_H
