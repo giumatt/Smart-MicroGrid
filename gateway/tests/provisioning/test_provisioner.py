@@ -20,7 +20,6 @@ def _create_self_signed_ca(common_name: str = "Test-Root-CA"):
             x509.NameAttribute(NameOID.COUNTRY_NAME, "IT"),
         ]
     )
-
     now_utc = datetime.now(timezone.utc)
     cert = (
         x509.CertificateBuilder()
@@ -60,14 +59,12 @@ def _build_csr(device_id: str, key_type: str = "ec", rsa_bits: int = 2048):
         )
         .sign(private_key, algorithm)
     )
-
     return private_key, csr
 
 @pytest.fixture
 def provisioner_paths(tmp_path, monkeypatch):
     certs_path = tmp_path / "certs"
     certs_path.mkdir(parents=True, exist_ok=True)
-
     db_path = tmp_path / "gateway.db"
     ca_key_path = certs_path / "ca.key"
     ca_cert_path = certs_path / "ca.crt"
@@ -89,7 +86,6 @@ def flask_client():
 
 def _write_ca_material(ca_key_path, ca_cert_path):
     ca_key, ca_cert = _create_self_signed_ca()
-
     ca_key_path.write_bytes(
         ca_key.private_bytes(
             encoding=serialization.Encoding.PEM,
@@ -98,42 +94,69 @@ def _write_ca_material(ca_key_path, ca_cert_path):
         )
     )
     ca_cert_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-
     return ca_key, ca_cert
 
-
-def test_init_database_creates_devices_table(provisioner_paths):
+def test_init_database_creates_devices_and_tokens_table(provisioner_paths):
     provisioner.init_database()
-
     with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
-        columns = {
+        devices_columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(devices)").fetchall()
         }
+        tokens_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(bootstrap_tokens)").fetchall()
+        }
 
-    assert {
-        "node_id",
-        "public_key",
-        "trust_score",
-        "status",
-        "last_seen",
-        "created_at",
-        "peak_power",
-    }.issubset(columns)
+    assert {"node_id", "public_key", "trust_score", "status", "last_seen", "created_at", "peak_power"}.issubset(devices_columns)
+    assert {"token", "node_id", "used", "created_at"}.issubset(tokens_columns)
 
 def test_store_device_public_key_upsert(provisioner_paths):
     provisioner.init_database()
+    
+    # Inserimento token manuale per i test
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-1', 'node-1')")
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-2', 'node-1')")
+        conn.commit()
 
-    provisioner._store_device_public_key("node-1", "PUBKEY-A", 2500.0)
-    provisioner._store_device_public_key("node-1", "PUBKEY-B", 3200.0)
+    provisioner._store_device_public_key("node-1", "PUBKEY-A", 2500.0, "token-1")
+    provisioner._store_device_public_key("node-1", "PUBKEY-B", 3200.0, "token-2")
 
     with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
         row = conn.execute(
             "SELECT public_key, trust_score, status, peak_power FROM devices WHERE node_id = ?",
             ("node-1",),
         ).fetchone()
+        
+        # Verifica che entrambi i token siano stati marcati come usati
+        token1_used = conn.execute("SELECT used FROM bootstrap_tokens WHERE token = 'token-1'").fetchone()[0]
+        token2_used = conn.execute("SELECT used FROM bootstrap_tokens WHERE token = 'token-2'").fetchone()[0]
 
     assert row == ("PUBKEY-B", 100.0, 0, 3200.0)
+    assert token1_used == 1
+    assert token2_used == 1
+
+def test_store_device_public_key_token_rules(provisioner_paths):
+    """Testa le difese contro Identity Hijacking e furto token"""
+    provisioner.init_database()
+    
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-assigned', 'node-A')")
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id, used) VALUES ('token-used', 'node-B', 1)")
+        conn.commit()
+
+    # 1. Token non esistente
+    with pytest.raises(provisioner.InputValidationError, match="Invalid bootstrap token"):
+        provisioner._store_device_public_key("node-1", "PUBKEY", 3000.0, "token-fake")
+
+    # 2. Token già usato
+    with pytest.raises(provisioner.InputValidationError, match="already been used"):
+        provisioner._store_device_public_key("node-B", "PUBKEY", 3000.0, "token-used")
+
+    # 3. Token assegnato ad un altro nodo
+    with pytest.raises(provisioner.InputValidationError, match="different device"):
+        provisioner._store_device_public_key("node-X", "PUBKEY", 3000.0, "token-assigned")
 
 def test_parse_enroll_payload_rejects_non_json_request():
     with provisioner.app.test_request_context(
@@ -150,24 +173,29 @@ def test_parse_enroll_payload_accepts_valid_json():
             "device_id": "device-1",
             "csr": "-----BEGIN CERTIFICATE REQUEST-----\nABC\n-----END CERTIFICATE REQUEST-----",
             "peak_power": 3300,
+            "bootstrap_token": "valid-token-123"
         },
     ):
-        device_id, csr_pem, peak_power = provisioner._parse_enroll_payload(request)
+        device_id, csr_pem, peak_power, bootstrap_token = provisioner._parse_enroll_payload(request)
 
     assert device_id == "device-1"
     assert "BEGIN CERTIFICATE REQUEST" in csr_pem
     assert peak_power == 3300.0
+    assert bootstrap_token == "valid-token-123"
 
 @pytest.mark.parametrize(
     "payload, error_pattern",
     [
-        ({"csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000}, "device_id"),
-        ({"device_id": "x" * 129, "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000}, "too long"),
-        ({"device_id": "device-1", "csr": "not-a-pem", "peak_power": 3000}, "PEM-encoded"),
-        ({"device_id": "device-1", "csr": "", "peak_power": 3000}, "invalid csr"),
-        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X"}, "peak_power"),
-        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": "3kW"}, "peak_power"),
-        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 0}, "greater than 0"),
+        ({"csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000, "bootstrap_token": "t"}, "device_id"),
+        ({"device_id": "x" * 129, "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000, "bootstrap_token": "t"}, "too long"),
+        ({"device_id": "device-1", "csr": "not-a-pem", "peak_power": 3000, "bootstrap_token": "t"}, "PEM-encoded"),
+        ({"device_id": "device-1", "csr": "", "peak_power": 3000, "bootstrap_token": "t"}, "invalid csr"),
+        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "bootstrap_token": "t"}, "peak_power"),
+        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": "3kW", "bootstrap_token": "t"}, "peak_power"),
+        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 0, "bootstrap_token": "t"}, "greater than 0"),
+        # Nuovi check sul token
+        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000}, "bootstrap_token"),
+        ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000, "bootstrap_token": ""}, "bootstrap_token"),
     ],
 )
 def test_parse_enroll_payload_validation_errors(payload, error_pattern):
@@ -177,20 +205,17 @@ def test_parse_enroll_payload_validation_errors(payload, error_pattern):
 
 def test_validate_csr_policy_rejects_cn_mismatch():
     _, csr = _build_csr("device-other", key_type="ec")
-
     with pytest.raises(provisioner.InputValidationError, match="must match device_id"):
         provisioner._validate_csr_policy(csr, "device-1")
 
 def test_validate_csr_policy_rejects_small_rsa(monkeypatch):
     monkeypatch.setattr(provisioner, "MIN_RSA_KEY_BITS", 2048)
     _, csr = _build_csr("device-1", key_type="rsa", rsa_bits=1024)
-
     with pytest.raises(provisioner.InputValidationError, match="RSA key too small"):
         provisioner._validate_csr_policy(csr, "device-1")
 
 def test_validate_csr_policy_rejects_unsupported_algorithm():
     _, csr = _build_csr("device-1", key_type="ed25519")
-
     with pytest.raises(provisioner.InputValidationError, match="Unsupported key algorithm"):
         provisioner._validate_csr_policy(csr, "device-1")
 
@@ -203,7 +228,6 @@ def test_build_device_certificate_sets_subject_and_ca_false():
     _, csr = _build_csr("device-1", key_type="ec")
 
     cert = provisioner._build_device_certificate(ca_cert, ca_key, csr, "device-1")
-
     cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
     bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
 
@@ -214,16 +238,21 @@ def test_build_device_certificate_sets_subject_and_ca_false():
 def test_enroll_success_returns_cert_and_persists_device(provisioner_paths, flask_client):
     _, ca_cert = _write_ca_material(provisioner_paths["ca_key_path"], provisioner_paths["ca_cert_path"])
     provisioner.init_database()
+    
+    # Inserimento token per il test
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('valid-token-123', 'device-123')")
+        conn.commit()
 
     _, csr = _build_csr("device-123", key_type="ec")
     csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode()
 
     resp = flask_client.post(
         "/enroll",
-        json={"device_id": "device-123", "csr": csr_pem, "peak_power": 4200},
+        json={"device_id": "device-123", "csr": csr_pem, "peak_power": 4200, "bootstrap_token": "valid-token-123"},
     )
-
     assert resp.status_code == 200
+
     body = resp.get_json()
     assert body["status"] == "success"
     assert "BEGIN CERTIFICATE" in body["certificate"]
@@ -248,21 +277,19 @@ def test_enroll_returns_400_for_invalid_json_payload(flask_client):
         data="not-json",
         content_type="application/json",
     )
-
     assert resp.status_code == 400
     assert "error" in resp.get_json()
 
 def test_enroll_returns_500_when_ca_unavailable(monkeypatch, flask_client):
     monkeypatch.setattr(provisioner, "get_ca_credentials", lambda: (None, None))
-
     resp = flask_client.post(
         "/enroll",
         json={
             "device_id": "device-1",
             "csr": "-----BEGIN CERTIFICATE REQUEST-----\nX\n-----END CERTIFICATE REQUEST-----",
             "peak_power": 3000,
+            "bootstrap_token": "some-token"
         },
     )
-
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Internal Server Error: CA not available"
