@@ -27,7 +27,7 @@ services:
       - DOCKER_INFLUXDB_INIT_PASSWORD=smartgrid
       - DOCKER_INFLUXDB_INIT_ORG=microgrid
       - DOCKER_INFLUXDB_INIT_BUCKET=telemetry
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN= # Your InfluxDB token
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=WxonkWMqr4Ll-1IANVbGIx4kiVSz2_48bkw1h9xfKgbKFToh7AgIIUonmpEGLiu4U4fVU4C7ycyguls-7DsFCA==
     volumes:
       - influx_data:/var/lib/influxdb2
       - influx_config:/etc/influxdb2
@@ -108,6 +108,7 @@ services:
 
   # Blockchain Ledger Service
   blockchain_service:
+    platform: linux/amd64
     build:
       context: ./src/blockchain
     container_name: smg_blockchain
@@ -116,19 +117,28 @@ services:
     expose:
       - "8001"
     environment:
-      - MQTT_TOPIC=${BLOCKCHAIN_MQTT_TOPIC:-microgrid/transfers}
-      - MQTT_TLS_CA_CERT=${BLOCKCHAIN_MQTT_TLS_CA_CERT:-/app/certs/ca.crt}
-      - MQTT_TLS_CERT=${BLOCKCHAIN_MQTT_TLS_CERT:-/app/certs/blockchain.crt}
-      - MQTT_TLS_KEY=${BLOCKCHAIN_MQTT_TLS_KEY:-/app/certs/blockchain.key}
+      - WEB3_PROVIDER_URI=http://evm_node:8545
     volumes:
-      - db_volume:/app/data
+      - ./src/blockchain/EnergyLedger.sol:/app/EnergyLedger.sol:ro # Monta lo smart contract
       - ./certs:/app/certs:ro
+      - db_volume:/app/data:ro
     depends_on:
       - mosquitto
-      - provisioner
+      - evm_node
     networks:
       - microgrid_net
     restart: always
+
+  evm_node:
+    image: trufflesuite/ganache:latest
+    container_name: smg_evm_node
+    #ports:
+    #  - "8545:8545"
+    networks:
+      - microgrid_net
+    command: ["--wallet.deterministic", "--chain.networkId", "1337", "--database.dbPath", "/app/db"]
+    volumes:
+      - blockchain_db:/app/db
 
   prometheus:
     image: prom/prometheus:latest
@@ -168,6 +178,7 @@ volumes:
   influx_config:
   prometheus_data:
   grafana_data:
+  blockchain_db:
 
 networks:
   microgrid_net:
