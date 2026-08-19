@@ -29,6 +29,9 @@ const char* const PROVISIONING_URL = "https://192.168.1.100:5000/enroll"; // URL
     #define MAX_PROVISIONING_RETRIES 3                      // Maximum number of attempts to enroll the device
 #endif
 
+// --- Provisioning Security ---
+const char* const BOOTSTRAP_TOKEN = "token-ESP";
+
 // --- Timing ---
 // SEND_INTERVAL_MS is defined in platformio.ini, but has a default fallback here
 #ifndef SEND_INTERVAL_MS
