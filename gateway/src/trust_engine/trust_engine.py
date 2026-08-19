@@ -4,7 +4,9 @@ Validates telemetry messages through cryptographic, temporal, and meteorological
 Manages device trust scores, self-healing, and banning logic.
 """
 import json
+from platform import node
 import sqlite3
+from threading import local
 import paho.mqtt.client as mqtt
 import os
 import time
@@ -36,6 +38,9 @@ MQTT_TLS_KEY = os.getenv("MQTT_TLS_KEY", f"{CERTS_PATH}/nodered.key")
 DB_PATH = os.getenv("DB_PATH", "/app/data/gateway.db")
 TRANSFERS_TOPIC = os.getenv("BLOCKCHAIN_MQTT_TOPIC", "microgrid/transfers")
 TRANSFER_TO_NODE = os.getenv("TRANSFER_TO_NODE", "grid")
+MIN_SPATIAL_QUORUM = int(os.getenv("MIN_SPATIAL_QUORUM", "3"))
+LOCAL_DROP_OBSERVATION_LIMIT = int(os.getenv("LOCAL_DROP_OBSERVATION_LIMIT", "12"))
+LOCAL_DROP_OBSERVATION_WINDOW_MIN = int(os.getenv("LOCAL_DROP_OBSERVATION_WINDOW_MIN", "10"))
 
 # InfluxDB Configuration
 INFLUX_URL = os.getenv("INFLUXDB_URL", "http://influxdb:8086")
@@ -73,6 +78,7 @@ forecast_cache = {
 try:
     influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+    query_api = influx_client.query_api()
     logger.info(f"[TRUST] InfluxDB client initialized successfully")
 except Exception as e:
     logger.error(f"[TRUST] Failed to initialize InfluxDB client: {e}")
@@ -80,27 +86,39 @@ except Exception as e:
 
 # --- SQLITE MANAGEMENT ---
 def init_db():
-    '''Initialize the SQLite database with safe migrations'''
+    """Initialize the SQLite database."""
+    migrations = [
+        ("peak_power", "ALTER TABLE devices ADD COLUMN peak_power REAL DEFAULT 3000.0"),
+        ("recent_violations", "ALTER TABLE devices ADD COLUMN recent_violations INTEGER DEFAULT 0"),
+        ("last_sequence", "ALTER TABLE devices ADD COLUMN last_sequence INTEGER DEFAULT 0"),
+        ("last_violation_time", "ALTER TABLE devices ADD COLUMN last_violation_time TIMESTAMP"),
+        ("observation_state", "ALTER TABLE devices ADD COLUMN observation_state TEXT"),
+        ("observation_since", "ALTER TABLE devices ADD COLUMN observation_since TIMESTAMP"),
+        ("observation_counter", "ALTER TABLE devices ADD COLUMN observation_counter INTEGER DEFAULT 0"),
+    ]
+
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # Main table creation
-        c.execute('''CREATE TABLE IF NOT EXISTS devices
-                  (node_id TEXT PRIMARY KEY,
-                  public_key TEXT NOT NULL,
-                  trust_score REAL DEFAULT 100.0,
-                  status INTEGER DEFAULT 0,
-                  last_seen TIMESTAMP,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS devices (
+                node_id TEXT PRIMARY KEY,
+                public_key TEXT NOT NULL,
+                trust_score REAL DEFAULT 100.0,
+                status INTEGER DEFAULT 0,
+                last_seen TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-        # Safe migration: add the peak_power column if it does not exist
-        try:
-            c.execute("ALTER TABLE devices ADD COLUMN peak_power REAL DEFAULT 3000.0")
-            logger.info("[TRUST] DB Migration: Added column 'peak_power'.")
-        except sqlite3.OperationalError:
-            pass # The column already exists
-            
+        for column_name, sql in migrations:
+            try:
+                c.execute(sql)
+                logger.info(f"[TRUST] DB Migration: Added column '{column_name}'.")
+            except sqlite3.OperationalError:
+                pass
+
         conn.commit()
         conn.close()
         logger.info(f"[TRUST] Database initialized/verified at {DB_PATH}")
@@ -109,16 +127,23 @@ def init_db():
         raise
 
 def check_device_status(cursor, node_id):
-    '''Check whether the device exists, is active or banned, and retrieve its data'''
     try:
-        cursor.execute("SELECT status, trust_score, peak_power FROM devices WHERE node_id = ?", (node_id,))
+        cursor.execute("""
+            SELECT status, trust_score, peak_power, recent_violations,
+                   last_sequence, observation_state, observation_since, observation_counter
+            FROM devices
+            WHERE node_id = ?
+        """, (node_id,))
         row = cursor.fetchone()
+
         if row is None:
-            return None, None, None # Unregistered device
-        return row[0], row[1], row[2] # status, trust_score, peak_power
+            return None, None, None, None, None, None, None, None
+
+        return row
+
     except Exception as e:
-        logger.error(f"[TRUST] Security gate check failed: {e}")
-        return None, None, None
+        logger.error(f"[TRUST] Error checking device status for {node_id}: {e}")
+        return None, None, None, None, None, None, None, None
 
 def ban_device(cursor, node_id):
     '''Permanently ban a device by setting status = 1 in the DB'''
@@ -208,6 +233,135 @@ def get_current_forecast():
             
     return forecast_cache["yield_percentage"]
 
+def get_node_stats(node_id, days_back=7):
+    """
+    Retrieves the mean (mu) and standard deviation (sigma) from a specific node
+    production about the last N days through a Flux query.
+    """
+    query = f'''
+        data = from(bucket: "{INFLUX_BUCKET}")
+            |> range(start: -{days_back}d)
+            |> filter(fn: (r) => r["_measurement"] == "production")
+            |> filter(fn: (r) => r["node_id"] == "{node_id}")
+            |> filter(fn: (r) => r["_field"] == "value")
+        
+        mu = data
+            |> mean()
+            |> yield(name: "mean")
+        sigma = data
+            |> stddev()
+            |> yield(name: "stddev")
+    '''
+
+    try:
+        tables = query_api.query(query)
+        mu = 0.0
+        sigma = 1.0
+
+        for table in tables:
+            for record in table.records:
+                if record.get_measurement() == "mean":
+                    mu = record.get_value()
+                elif record.get_measurement() == "stddev":
+                    sigma = record.get_value() or 1.0
+        return mu, sigma
+    except Exception as e:
+        logger.error(f"[TRUST] Error on getting stats query for {node_id}: {e}")
+        return 0.0, 1.0
+
+MIN_EFFICIENCY_RATIO = float(os.getenv("MIN_EFFICIENCY_RATIO", "0.10"))
+
+def validate_production_behavior(production, peak_power, expected_production, mu, sigma):
+    """
+    Asymmetric behavioral analysis useful to spot spoofing or deterioration.
+    """
+    # Keep the hard overproduction boundary aligned with the meteorological
+    # tolerance to avoid contradictory decisions between behavior analysis and
+    # meteo validation.
+    overproduction_margin = max(TOLERANCE_PERCENTAGE, 0.05)
+
+    if production > (expected_production * (1.0 + overproduction_margin)) + 10.0:
+        # Node states a production clearly greater than the forecast-tolerated solar production
+        return False, "overproduction"
+
+    # Truth floor independent from recent history
+    absolute_floor = peak_power * MIN_EFFICIENCY_RATIO * (expected_production / max(peak_power, 1))
+    if expected_production > 50 and production < absolute_floor:
+        return False, "below_absolute_floor"
+
+    # Per-zero divisions handling
+    safe_sigma = sigma if sigma > 0 else 1.0
+    z_score = (production - mu) / safe_sigma
+
+    # A sudden crash is suspicious; it indicates an anomaly that warrants a space check
+    if z_score < -3.0:
+        return False, "sudden_drop"     
+    
+    # The decline is part of the node's natural deterioration
+    return True, "consistent_degradation"
+
+def check_spatial_anomaly(node_id, time_window=5):
+    """
+    Check whether the rest of the microgrid is experiencing a drop in generation.
+    Returns True if there is a general drop (eg. transient shading), False otherwise.
+    """
+
+    conn = sqlite3.connect(DB_PATH)
+    trusted_neighbors = conn.execute(
+        "SELECT node_id FROM devices WHERE node_id != ? AND status = 0 AND trust_score > 60",
+        (node_id,)
+    ).fetchall()
+    conn.close()
+
+    # Require a real minimum quorum of trusted neighbors before trusting swarm consensus
+    if len(trusted_neighbors) < MIN_SPATIAL_QUORUM:
+        return False
+
+    nodes_list = ', '.join([f'"{n[0]}"' for n in trusted_neighbors])
+
+    query = f'''
+        trusted_nodes = [{nodes_list}]
+        data = from(bucket: "{INFLUX_BUCKET}")
+            |> range(start: -{time_window}m)
+            |> filter(fn: (r) => r["_measurement"] == "production")
+            |> filter(fn: (r) => contains(value: r["node_id"], set: trusted_nodes))
+            |> filter(fn: (r) => r["_field"] == "value")
+
+        recent = data |> range(start: -1m) |> mean() |> yield(name: "recent_mean")
+        past = data |> range(start: -{time_window}m, stop: -1m) |> mean() |> yield(name: "past_mean")
+    '''
+
+    try:
+        tables = query_api.query(query)
+        recent_mean = 0.0
+        past_mean = 0.0
+
+        for table in tables:
+            for record in table.records:
+                if record.get_measurement() == "recent_mean":
+                    recent_mean = record.get_value() or 0.0
+                elif record.get_measurement() == "past_mean":
+                    past_mean = record.get_value() or 0.0
+
+        if past_mean > 0 and recent_mean < (past_mean * 0.85):
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"[TRUST] Error on spatial check query: {e}")
+        return False
+
+"""# Computes the neighborhood mean against the previous minutes
+    query = f'''
+        data = from(bucket: "{INFLUX_BUCKET}")
+            |> range(start: -{time_window}m)
+            |> filter(fn: (r) => r["_measurement"] == "production")
+            |> filter(fn: (r) => r["node_id"] != "{node_id}")
+            |> filter(fn: (r) => r["_field"] == "value")
+        
+        recent = data |> range(start: -1m) |> mean() |> yield(name: "recent_mean")
+        past = data |> range(start: -{time_window}m, stop: -1m) |> mean() |> yield(name: "past_mean")
+    '''"""
+
 # --- MQTT MESSAGES HANDLER ---
 @TE_PROCESSING_TIME.time()
 def on_message(client, userdata, msg):
@@ -216,22 +370,45 @@ def on_message(client, userdata, msg):
     1. Parsing -> 2. Signature -> 3. Status -> 4. Time -> 5. Weather -> 6. Storage
     '''
     TE_MSG_RECEIVED.inc()
-    
+
     try:
         payload = json.loads(msg.payload.decode())
-        
-        # 1. PAYLOAD INTEGRITY CHECK
-        required_keys = ['node_id', 'timestamp', 'production', 'sig']
+
+        required_keys = ['node_id', 'timestamp', 'production', 'sig', 'seq']
         if not all(k in payload for k in required_keys):
             logger.warning("[TRUST] Message discarded: incomplete or malformed payload")
             TE_MSG_REJECTED.labels(reason='malformed_payload').inc()
             TE_VALIDATIONS.labels(result='rejected', reason='malformed_payload').inc()
             return
-        
+
         node_id = payload['node_id']
-        timestamp = payload['timestamp']
-        production = float(payload['production'])
-        signature = payload.pop('sig') # Extract the signature by removing it from the dict
+
+        try:
+            timestamp = int(payload['timestamp'])
+        except (TypeError, ValueError) as e:
+            logger.error(f"[TRUST] Invalid timestamp for {node_id}: {payload.get('timestamp')!r} ({e})")
+            TE_MSG_REJECTED.labels(reason='invalid_timestamp').inc()
+            TE_VALIDATIONS.labels(result='rejected', reason='invalid_timestamp').inc()
+            return
+
+        try:
+            production = float(payload['production'])
+        except (TypeError, ValueError) as e:
+            logger.error(f"[TRUST] Invalid production for {node_id}: {payload.get('production')!r} ({e})")
+            TE_MSG_REJECTED.labels(reason='invalid_production').inc()
+            TE_VALIDATIONS.labels(result='rejected', reason='invalid_production').inc()
+            return
+
+        incoming_seq = payload.get("seq")
+        try:
+            incoming_seq = int(incoming_seq)
+        except (TypeError, ValueError) as e:
+            logger.error(f"[TRUST] Invalid seq for {node_id}: {incoming_seq!r} ({e})")
+            TE_MSG_REJECTED.labels(reason='invalid_sequence').inc()
+            TE_VALIDATIONS.labels(result='rejected', reason='invalid_sequence').inc()
+            return
+
+        signature = payload.pop('sig')
         signed_payload = payload.copy()
         validation_reason = "ok"
         
@@ -245,7 +422,8 @@ def on_message(client, userdata, msg):
         # 3. DATABASE SECURITY GATE (Authorization)
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        status, current_trust, peak_power = check_device_status(cursor, node_id)
+        status, current_trust, peak_power, recent_violations, last_sequence,\
+            observation_state, observation_since, observation_counter = check_device_status(cursor, node_id)
         
         if status is None:
             logger.error(f"[TRUST] Message discarded: unknown device {node_id}")
@@ -259,7 +437,17 @@ def on_message(client, userdata, msg):
             TE_VALIDATIONS.labels(result='rejected', reason='banned_device').inc()
             conn.close()
             return
-            
+        
+        # 3bis. ANTI-REPLAY GATE
+        if incoming_seq <= last_sequence:
+            logger.warning(f"[TRUST] Replay/duplicate detected for {node_id}: seq {incoming_seq} <= last {last_sequence}")
+            TE_MSG_REJECTED.labels(reason='replay_detected').inc()
+            TE_VALIDATIONS.labels(result='rejected', reason='replay_detected').inc()
+            conn.close()
+            return
+
+        cursor.execute("UPDATE devices SET last_sequence = ? WHERE node_id = ?", (incoming_seq, node_id))
+
         # Assign 3000W as the default if the database value is null
         peak_power = peak_power if peak_power else 3000.0
 
@@ -268,19 +456,194 @@ def on_message(client, userdata, msg):
         time_diff = abs(current_time - timestamp)
         
         if time_diff > TIME_WINDOW:
-            new_trust = max(0, current_trust - TRUST_PENALTY)
-            cursor.execute("UPDATE devices SET trust_score = ? WHERE node_id = ?", (new_trust, node_id))
-            logger.warning(f"[TRUST] Temporal anomaly ({node_id}): difference {time_diff}s. Trust: {current_trust:.1f} -> {new_trust:.1f}")
+            severity_multiplier = min(3.0, time_diff / TIME_WINDOW)
+            scaled_penalty = TRUST_PENALTY * severity_multiplier
+            new_trust = max(0, current_trust - scaled_penalty)
+            cursor.execute(
+                "UPDATE devices SET trust_score = ?, recent_violations = recent_violations + 1 WHERE node_id = ?",
+                (new_trust, node_id)
+            )
+            logger.warning(f"[TRUST] Temporal anomaly ({node_id}): diff {time_diff}s, penalty x{severity_multiplier:.1f}")
             TE_PENALTY_APPLIED.labels(reason='temporal_anomaly').inc()
-            
             if new_trust < TRUST_THRESHOLD_BAN: ban_device(cursor, node_id)
             conn.commit(); conn.close()
             TE_MSG_REJECTED.labels(reason='temporal_anomaly').inc()
-            TE_VALIDATIONS.labels(result='rejected', reason='temporal_anomaly').inc()
             return
 
         # 5. METEOROLOGICAL VALIDATION AND SELF-HEALING (Ground Truth)
+        
+        # PHASE 1: metrics gathering
         expected_yield = get_current_forecast()
+        expected_production = peak_power * expected_yield
+
+        mu, sigma = get_node_stats(node_id)
+        neigh_drop = check_spatial_anomaly(node_id)
+
+        # Basic weather (Open-Meteo) check
+        if expected_production < 50:
+            meteo_valid = abs(production - expected_production) <= 100.0
+        else:
+            meteo_valid = (abs(production - expected_production) / expected_production) <= TOLERANCE_PERCENTAGE
+
+        is_valid = False
+        reason = "ok"
+        new_trust = current_trust
+        publish_to_blockchain = True
+
+        # PHASE 2: risk matrix
+        behavior_valid, behavior_reason = validate_production_behavior(
+            production, peak_power, expected_production, mu, sigma
+        )
+
+        # First, accept values that are already within the declared meteorological tolerance.
+        if meteo_valid:
+            is_valid = True
+            reason = "ok_meteo"
+
+        elif behavior_reason == "overproduction":
+            new_trust = max(0.0, current_trust - TRUST_PENALTY)
+            reason = "overproduction"
+            cursor.execute(
+                "UPDATE devices SET recent_violations = recent_violations + 1, last_violation_time = CURRENT_TIMESTAMP WHERE node_id = ?",
+                (node_id,)
+            )
+            TE_PENALTY_APPLIED.labels(reason=reason).inc()
+            logger.warning(
+                f"[TRUST] Spoofing detected for {node_id}: {production:.0f}W exceeds physical limits. "
+                f"Trust: {current_trust:.1f} -> {new_trust:.1f}"
+            )
+
+        elif behavior_reason == "below_absolute_floor":
+            new_trust = max(0.0, current_trust - TRUST_PENALTY)
+            reason = "below_absolute_floor"
+            cursor.execute(
+                "UPDATE devices SET recent_violations = recent_violations + 1, last_violation_time = CURRENT_TIMESTAMP WHERE node_id = ?",
+                (node_id,)
+            )
+            logger.warning(f"[TRUST] Floor violation for {node_id}: {production:.0f}W below minimum efficiency.")
+            TE_PENALTY_APPLIED.labels(reason=reason).inc()
+
+        elif behavior_reason == "consistent_degradation":
+            is_valid = True
+            reason = "ok_degradation"
+
+        elif behavior_reason == "sudden_drop":
+            if neigh_drop:
+                is_valid = True
+                reason = "ok_neigh"
+                cursor.execute(
+                    """
+                    UPDATE devices
+                    SET observation_state = NULL,
+                        observation_since = NULL,
+                        observation_counter = 0
+                    WHERE node_id = ?
+                    """,
+                    (node_id,)
+                )
+            else:
+                is_valid = True
+                reason = "suspect_local_drop"
+                publish_to_blockchain = False
+
+                if observation_state == "suspect_local_drop":
+                    cursor.execute(
+                        """
+                        UPDATE devices
+                        SET observation_counter = observation_counter + 1,
+                            last_seen = CURRENT_TIMESTAMP
+                        WHERE node_id = ?
+                        """,
+                        (node_id,)
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE devices
+                        SET observation_state = 'suspect_local_drop',
+                            observation_since = CURRENT_TIMESTAMP,
+                            observation_counter = 1,
+                            last_seen = CURRENT_TIMESTAMP
+                        WHERE node_id = ?
+                        """,
+                        (node_id,)
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT observation_counter,
+                           observation_since
+                    FROM devices
+                    WHERE node_id = ?
+                    """,
+                    (node_id,)
+                )
+                obs_counter, obs_since = cursor.fetchone()
+
+                cursor.execute(
+                    """
+                    SELECT
+                        observation_since < datetime('now', ?)
+                    FROM devices
+                    WHERE node_id = ?
+                    """,
+                    (f'-{LOCAL_DROP_OBSERVATION_WINDOW_MIN} minutes', node_id)
+                )
+                row = cursor.fetchone()
+                obs_window_expired = bool(row[0]) if row else False
+
+                if obs_counter >= LOCAL_DROP_OBSERVATION_LIMIT and obs_window_expired:
+                    new_trust = max(0.0, current_trust - TRUST_PENALTY)
+                    reason = "suspect_local_drop_escalated"
+                    publish_to_blockchain = False
+                    cursor.execute(
+                        """
+                        UPDATE devices
+                        SET recent_violations = recent_violations + 1,
+                            last_violation_time = CURRENT_TIMESTAMP,
+                            observation_state = NULL,
+                            observation_since = NULL,
+                            observation_counter = 0
+                        WHERE node_id = ?
+                        """,
+                        (node_id,)
+                    )
+                    TE_PENALTY_APPLIED.labels(reason=reason).inc()
+                    logger.warning(
+                        f"[TRUST] Local drop persisted for {node_id}; escalating after observation. "
+                        f"Trust: {current_trust:.1f} -> {new_trust:.1f}"
+                    )
+                else:
+                    logger.warning(
+                        f"[TRUST] Localized sudden drop for {node_id}; under observation "
+                        f"(counter={obs_counter}, blockchain_suspended=true)."
+                    )
+                            
+        # SELF HEALING
+        if is_valid and reason not in {"suspect_local_drop", "suspect_local_drop_escalated"} and current_trust < 100.0:
+            decay_factor = 0.5 ** min(recent_violations, 5)
+            bonus = TRUST_RECOVERY_BONUS * decay_factor
+            new_trust = min(100.0, current_trust + bonus)
+            logger.debug(
+                f"[TRUST] Recovery for {node_id}: bonus={bonus:.2f} "
+                f"(violations={recent_violations}, decay={decay_factor:.3f}). "
+                f"Trust: {current_trust:.1f} -> {new_trust:.1f}"
+            )
+        # Update score
+        cursor.execute('''UPDATE devices
+                        SET trust_score = ?, last_seen = CURRENT_TIMESTAMP
+                       WHERE node_id = ?''', (new_trust, node_id))
+        
+        # Violations will decade after 24h of good messages
+        if is_valid:
+            cursor.execute('''
+                UPDATE devices
+                SET recent_violations = MAX(0, recent_violations - 1),
+                    last_violation_time = CURRENT_TIMESTAMP
+                WHERE node_id = ? AND last_violation_time < datetime('now', '-1 day')
+            ''', (node_id,))
+
+        """expected_yield = get_current_forecast()
         expected_production = peak_power * expected_yield
         
         is_valid = False
@@ -311,7 +674,7 @@ def on_message(client, userdata, msg):
         cursor.execute('''UPDATE devices 
                           SET trust_score = ?, last_seen = CURRENT_TIMESTAMP 
                           WHERE node_id = ?''', (new_trust, node_id))
-        
+        """
         if new_trust < TRUST_THRESHOLD_BAN:
             ban_device(cursor, node_id)
 
@@ -324,7 +687,7 @@ def on_message(client, userdata, msg):
             return
 
         # 6. SAVE TO INFLUXDB & BLOCKCHAIN (only if the node is still healthy)
-        if new_trust >= TRUST_THRESHOLD_BAN:
+        if new_trust >= TRUST_THRESHOLD_BAN and publish_to_blockchain:
             # Publish to Blockchain Ledger
             try:
                 transfer_payload = {
@@ -364,8 +727,8 @@ def on_message(client, userdata, msg):
         logger.error(f"[TRUST] Message discarded: invalid JSON format")
         TE_MSG_REJECTED.labels(reason='invalid_json').inc()
         TE_VALIDATIONS.labels(result='rejected', reason='invalid_json').inc()
-    except ValueError:
-        logger.error(f"[TRUST] Message discarded: incorrect data types in the payload")
+    except ValueError as e:
+        logger.error(f"[TRUST] Unexpected ValueError in on_message: {e}")
         TE_MSG_REJECTED.labels(reason='invalid_types').inc()
         TE_VALIDATIONS.labels(result='rejected', reason='invalid_types').inc()
     except Exception as e:
