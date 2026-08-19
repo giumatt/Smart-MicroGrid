@@ -35,4 +35,9 @@ bool sendData(JsonDocument& doc);
  */
 bool isConnected();
 
+/**
+ * Returns the hash of the last block mined by the smart contract.
+ */
+String getLatestBlockHash();
+
 #endif // NETWORK_MANAGER_H
