@@ -83,22 +83,8 @@ void setup() {
                 break;
             }
 
-            // Decide retry delay based on the last HTTP code printed by provisioning_client
-            // The provisioning client prints: [PROV] RESULT_HTTP_CODE=<n>
-            // If code is 4xx, slow retry.
-            //
-            // NOTE: We also support a direct accessor if present.
-            int lastCode = -1;
-#if defined(__has_include)
-    #if __has_include("provisioning_client.h")
-        // If provisioning_client exposes getLastProvisioningHttpCode(), use it.
-        // (Safe even if not declared? It must be declared in header to compile.)
-    #endif
-#endif
-
-            // If you add the prototype `int getLastProvisioningHttpCode();` to the header,
-            // uncomment the following line:
-            lastCode = getLastProvisioningHttpCode();
+            // A 4xx means a client/payload problem: retry slowly
+            int lastCode = getLastProvisioningHttpCode();
 
             retries--;
 
@@ -168,19 +154,24 @@ void loop() {
             // A. Read sensor data (simulated or real based on SIMULATION_MODE)
             EnergyData data = readSensorData();
 
-            // B.  Validate timestamp (Production only)
-#if defined(REQUIRE_VALID_TIMESTAMP) && REQUIRE_VALID_TIMESTAMP == 1
+            // B.  Validate timestamp: the gateway discards data from an unsynchronized clock
             if (data.timestamp == 0 || data.timestamp < 1600000000) {
                 Serial.println("[ERR] Invalid timestamp.  Skipping transmission.");
                 return;
             }
-#endif
+
+            // Anti-replay sequence (0 means it could not be persisted)
+            uint32_t seq = getNextSequence();
+            if (seq == 0) {
+                Serial.println("[ERR] Sequence counter unavailable. Skipping transmission.");
+                return;
+            }
 
             // C.  Create JSON document
             JsonDocument doc;
             doc["node_id"] = MQTT_CLIENT_ID;
             doc["timestamp"] = data.timestamp;
-            doc["seq"] = getNextSequence();
+            doc["seq"] = seq;
             doc["production"]  = serialized(String(data.power, 2));    // raw number with 2 decimals
 
             // D. Digital Signature (Integrity & Non-Repudiation)

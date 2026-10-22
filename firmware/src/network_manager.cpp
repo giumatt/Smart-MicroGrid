@@ -43,10 +43,6 @@ static bool waitForTimeSync(int timeout_sec);
 static String latestBlockHash = "0x0000000000000000000000000000000000000000000000000000000000000000";
 static uint32_t latestBlockNumber = 0;
 
-String getLatestBlockHash() {
-    return latestBlockHash;
-}
-
 // --- Callback for receiving MQTT messages ---
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, MQTT_BLOCKS_TOPIC) == 0) {
@@ -58,12 +54,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             latestBlockNumber = doc["blockNumber"].as<uint32_t>();
             String latestTxNode = doc["latestTxNode"].as<String>();
             
-            DEBUG_PRINTF("[BLOCKCHAIN] Sync! Blocco #%d | Hash: %s... | Tx di: %s\n", 
+            DEBUG_PRINTF("[BLOCKCHAIN] Sync! Block #%u | Hash: %s... | Tx from: %s\n", 
                          latestBlockNumber, 
                          latestBlockHash.substring(0, 10).c_str(),
                          latestTxNode.c_str());
         } else {
-            DEBUG_PRINTLN("[BLOCKCHAIN] Errore nel parsing del blocco JSON.");
+            DEBUG_PRINTLN("[BLOCKCHAIN] Failed to parse the block JSON.");
         }
     }
 }

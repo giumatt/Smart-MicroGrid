@@ -15,8 +15,6 @@ void initSensors() {
     Serial.println("[SENSOR] Smart Meter SIMULATOR initialized.");
 #else
     Serial.println("[SENSOR] Smart Meter initialized (real sensors).");
-    // analogReadResolution(12);
-    // analogSetAttenuation(ADC_11db);
 #endif
 }
 
@@ -36,6 +34,53 @@ static float sampleGaussian(float mean, float stddev) {
     const float u2 = (random(0, 10000) / 10000.0f);
     const float z0 = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI * u2);
     return mean + z0 * stddev;
+}
+
+// Same sun-position model used by the gateway;
+// the honest part of the simulation never reports more than the sun allows
+static const float NIGHT_ELEVATION_DEG = -2.0f;
+static const float MAX_DIFFUSE_WM2 = 120.0f;
+
+static float solarElevationDeg(uint32_t nowTs) {
+    time_t nowTime = static_cast<time_t>(nowTs);
+    struct tm utc;
+    if (!gmtime_r(&nowTime, &utc)) {
+        return -90.0f;
+    }
+
+    const float deg = (float)M_PI / 180.0f;
+    const float lat = FORECAST_LATITUDE * deg;
+    const float hour = utc.tm_hour + utc.tm_min / 60.0f + utc.tm_sec / 3600.0f;
+    const float gamma = 2.0f * (float)M_PI / 365.0f * (utc.tm_yday + (hour - 12.0f) / 24.0f);
+
+    const float eqTimeMin = 229.18f * (0.000075f + 0.001868f * cosf(gamma) - 0.032077f * sinf(gamma)
+                                       - 0.014615f * cosf(2 * gamma) - 0.040849f * sinf(2 * gamma));
+    const float declination = 0.006918f - 0.399912f * cosf(gamma) + 0.070257f * sinf(gamma)
+                              - 0.006758f * cosf(2 * gamma) + 0.000907f * sinf(2 * gamma)
+                              - 0.002697f * cosf(3 * gamma) + 0.00148f * sinf(3 * gamma);
+
+    const float hourAngle = ((hour * 60.0f + eqTimeMin + 4.0f * FORECAST_LONGITUDE) / 4.0f - 180.0f) * deg;
+    const float cosZenith = sinf(lat) * sinf(declination) + cosf(lat) * cosf(declination) * cosf(hourAngle);
+    return 90.0f - acosf(clampFloat(cosZenith, -1.0f, 1.0f)) / deg;
+}
+
+static float physicalYieldLimit(uint32_t nowTs) {
+    if (nowTs == 0) {
+        return 0.0f;
+    }
+
+    const float elevation = solarElevationDeg(nowTs);
+    if (elevation <= NIGHT_ELEVATION_DEG) {
+        return 0.0f;
+    }
+
+    // Clear-sky behavior
+    const float zenith = fminf(90.0f - elevation, 96.0f);
+    const float airMass = 1.0f / (cosf(zenith * (float)M_PI / 180.0f)
+                                  + 0.50572f * powf(96.07995f - zenith, -1.6364f));
+    const float directNormal = 1353.0f * powf(0.7f, powf(airMass, 0.678f));
+    const float diffuse = MAX_DIFFUSE_WM2 * fminf(1.0f, (elevation - NIGHT_ELEVATION_DEG) / 10.0f);
+    return (1.1f * directNormal + diffuse) / 1000.0f;
 }
 
 static float computeFallbackYield(uint32_t nowTs) {
@@ -68,6 +113,7 @@ static float computeFallbackYield(uint32_t nowTs) {
 static bool fetchOpenMeteoYield(float& outYield) {
 #if defined(USE_FORECAST_API) && USE_FORECAST_API == 1
     if (WiFi.status() != WL_CONNECTED) {
+        DEBUG_PRINTLN("[WEATHER] Open-Meteo skipped: Wi-Fi disconnected");
         return false;
     }
 
@@ -86,15 +132,19 @@ static bool fetchOpenMeteoYield(float& outYield) {
     String url = String(FORECAST_API_URL) +
                  "?latitude=" + String(FORECAST_LATITUDE, 4) +
                  "&longitude=" + String(FORECAST_LONGITUDE, 4) +
-                 "&current=shortwave_radiation";
+                 "&current=shortwave_radiation&timezone=auto";
 
     if (!http.begin(client, url)) {
+        DEBUG_PRINTLN("[WEATHER] Open-Meteo request initialization failed");
         return false;
     }
     http.setTimeout(FORECAST_TIMEOUT_MS);
+    http.addHeader("Accept", "application/json");
 
     int httpCode = http.GET();
     if (httpCode != 200) {
+        DEBUG_PRINTF("[WEATHER] Open-Meteo HTTP error: %d (%s)\n",
+                     httpCode, HTTPClient::errorToString(httpCode).c_str());
         http.end();
         return false;
     }
@@ -105,15 +155,24 @@ static bool fetchOpenMeteoYield(float& outYield) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
+        DEBUG_PRINTF("[WEATHER] Open-Meteo JSON error: %s\n", err.c_str());
         return false;
     }
 
-    float radiation = doc["current"]["shortwave_radiation"] | -1.0f;
+    JsonVariant radiationValue = doc["current"]["shortwave_radiation"];
+    if (radiationValue.isNull() || !radiationValue.is<float>() && !radiationValue.is<int>()) {
+        DEBUG_PRINTLN("[WEATHER] Open-Meteo response missing numeric radiation");
+        return false;
+    }
+
+    float radiation = radiationValue.as<float>();
     if (radiation < 0.0f) {
+        DEBUG_PRINTF("[WEATHER] Open-Meteo returned invalid radiation: %.1f W/m2\n", radiation);
         return false;
     }
 
     outYield = clampFloat(radiation / FALLBACK_PEAK_IRRADIANCE_WM2, 0.0f, 1.0f);
+    DEBUG_PRINTF("[WEATHER] Open-Meteo radiation=%.1f W/m2 yield=%.3f\n", radiation, outYield);
     return true;
 #else
     (void)outYield;
@@ -121,28 +180,55 @@ static bool fetchOpenMeteoYield(float& outYield) {
 #endif
 }
 
+// Open-Meteo "current" data changes every 15 minutes: devices and trust engine refresh on the
+// same clock-aligned slots, so that they read the same forecast value.
+static const uint32_t FORECAST_SLOT_SECONDS = 900;
+static const float KC_MIN_CLEAR_GHI = 50.0f;
+static const float KC_MAX = 1.2f;
+
+// Clear-sky global horizontal irradiance (Haurwitz model), same as the trust engine
+static float clearSkyGhi(float elevationDeg) {
+    if (elevationDeg <= 0.0f) {
+        return 0.0f;
+    }
+    const float sinElevation = sinf(elevationDeg * (float)M_PI / 180.0f);
+    return 1098.0f * sinElevation * expf(-0.057f / sinElevation);
+}
+
 static float getYieldPercentage(uint32_t nowTs) {
     static bool cacheValid = false;
+    static bool fromApi = false;
+    static bool skyKnown = false;
     static float cachedYield = 0.0f;
-    static uint32_t cachedAt = 0;
+    static float skyIndex = 0.0f;
+    static uint32_t cachedSlot = 0;
 
-    if (cacheValid && nowTs >= cachedAt && (nowTs - cachedAt) < FORECAST_CACHE_SECONDS) {
+    const uint32_t slot = nowTs / FORECAST_SLOT_SECONDS;
+    if (!cacheValid || slot != cachedSlot) {
+        float yieldPercentage = 0.0f;
+        fromApi = fetchOpenMeteoYield(yieldPercentage);
+        if (fromApi) {
+            // The value is the average of the previous 15 minutes
+            const float clear = clearSkyGhi(solarElevationDeg(nowTs - FORECAST_SLOT_SECONDS / 2));
+            skyKnown = (clear >= KC_MIN_CLEAR_GHI);
+            skyIndex = skyKnown ? fminf(KC_MAX, yieldPercentage * 1000.0f / clear) : 0.0f;
+            cachedYield = yieldPercentage;
+        } else {
+            DEBUG_PRINTLN("[WEATHER] Open-Meteo unavailable: using mathematical fallback");
+        }
+        cachedSlot = slot;
+        cacheValid = true;
+    }
+
+    if (!fromApi) {
+        // Deterministic function of time
+        return computeFallbackYield(nowTs);
+    }
+    if (!skyKnown) {
+        // Sun too low at refresh time
         return cachedYield;
     }
-
-    float yieldPercentage = 0.0f;
-    if (fetchOpenMeteoYield(yieldPercentage)) {
-        cachedYield = yieldPercentage;
-        cachedAt = nowTs;
-        cacheValid = true;
-        return yieldPercentage;
-    }
-
-    yieldPercentage = computeFallbackYield(nowTs);
-    cachedYield = yieldPercentage;
-    cachedAt = nowTs;
-    cacheValid = true;
-    return yieldPercentage;
+    return clampFloat(skyIndex * clearSkyGhi(solarElevationDeg(nowTs)) / 1000.0f, 0.0f, 1.0f);
 }
 
 EnergyData buildSimulatedEnergyData(float yieldPercentage,
@@ -179,7 +265,7 @@ EnergyData readSimulatedData() {
     }
 
     uint32_t nowTs = static_cast<uint32_t>(time(NULL));
-    float yieldPercentage = getYieldPercentage(nowTs);
+    float yieldPercentage = fminf(getYieldPercentage(nowTs), physicalYieldLimit(nowTs));
     float powerNoiseFactor = sampleGaussian(0.0f, FORECAST_NOISE_STDDEV);
     float voltageOffset = (random(-10, 11) / 10.0);
 

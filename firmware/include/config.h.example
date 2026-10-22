@@ -66,9 +66,7 @@ const int PIN_CURRENT = 35;                                 // ADC Pin for readi
     #define FORECAST_LONGITUDE 16.0                         // Default longitude for weather forecast
 #endif
 
-#ifndef FORECAST_CACHE_SECONDS
-    #define FORECAST_CACHE_SECONDS 1800                     // Time-To-Live (TTL) for cached weather data in seconds (30 mins)
-#endif
+// The forecast is refreshed on clock-aligned 15-minute slots, like the gateway (sensor_manager.cpp)
 
 #ifndef FORECAST_TIMEOUT_MS
     #define FORECAST_TIMEOUT_MS 10000                       // Timeout for the forecast API request in milliseconds
