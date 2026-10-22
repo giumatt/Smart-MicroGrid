@@ -187,12 +187,28 @@ Key dashboards available:
 ### 4. Trust Engine Operation
 
 The centralized Trust Engine continuously:
-- Verifies ECDSA signatures on incoming payloads
+- Verifies ECDSA signatures on the exact bytes signed by the device
+- Rejects replayed messages through the signed, persisted per-device sequence (`seq`)
 - Queries Open-Meteo API for real-time solar irradiance data
-- Calculates expected production: `P_expected = peak_power * expected_yield`
-- Compares reported production against tolerance thresholds:
-  - Daylight (P_expected >= 50W): Allow +/- 25% deviation
-  - Overcast/Night: Allow +/- 100W absolute deviation
+- Computes the sun position from the plant coordinates and the signed timestamp, and
+  derives a physical cap (clear-sky irradiance on an ideally oriented panel, plus a
+  cloud-enhancement margin): any value above it is penalized, so at night only meter noise
+  (`NIGHT_MAX_WATT`) is accepted
+- Derives the clear-sky index `kc = forecast / clear-sky irradiance` from the forecast (refreshed
+  on clock-aligned 15-minute slots) and carries it along the sun position:
+  `P_expected = min(peak_power * kc * clear_sky(t), clear-sky limit)`
+- Applies a dynamic tolerance: tight with a clear sky (`TOL_CLEAR`, 10%), wider with clouds or
+  without a forecast (up to `TOL_CLOUDY`, 80%), never below 2% of the peak power
+- Checks the tolerance on the energy of 15-minute windows (the forecast resolution): the sun
+  between clouds averages out, a steady overclaim does not; an excess costs one penalty per
+  window, and a clean window earns the trust recovery
+- Outside the tolerance, applies an asymmetric risk matrix: declaring too much is the only
+  profitable fraud, so overproduction is the only case penalized and discarded. Lower values
+  are always credited as declared and never penalized; sudden local drops (z-score on the last
+  hour, not shared by most trusted neighbors) and near-zero production are only monitored, and
+  if they persist they raise a maintenance alert (`te_maintenance_alerts_total`)
+- Credits energy as `power x elapsed time` (capped at `MAX_ENERGY_INTERVAL_S`), so the
+  message rate does not change the energy recorded on the ledger (stored in mWh)
 - Updates node reputation scores based on deviation severity
 - Bans nodes when trust score falls below threshold
 
@@ -273,7 +289,7 @@ Tests validate:
 ### Attack Mitigations
 - **Spoofing/Identity Attacks**: Mutual TLS with certificate pinning
 - **Data Tampering**: ECDSA signatures and meteorological validation
-- **Replay Attacks**: NTP-synchronized timestamp validation
+- **Replay Attacks**: signed monotonic sequence numbers (Trust Engine, relayer and smart contract), plus NTP-synchronized timestamp validation
 - **Information Disclosure**: TLS v1.3 end-to-end encryption
 - **Denial of Service**: Rate-limiting and cryptographic operation optimization
 - **Logical Data Injection**: Meteorological Ground Truth baseline comparison
