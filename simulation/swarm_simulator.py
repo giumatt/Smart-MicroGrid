@@ -7,9 +7,7 @@ Key features:
 - HTTPS enrollment with the provisioner using a CSR to obtain a device certificate (Bootstrap Token secured).
 - MQTT connection on port 8883 with mTLS for each device.
 - Photovoltaic telemetry synchronized with Open-Meteo (or gateway-compatible mathematical fallback).
-- Payload signing:
-  - HMAC-SHA256 preferred if the backend returns an HMAC key.
-  - ECDSA-SHA256 fallback compatible with current firmware.
+- ECDSA-SHA256 payload signing, compatible with the firmware.
 - Mandatory jitter on every sleep to prevent synchronized bursts.
 - Graceful shutdown on SIGINT/SIGTERM.
 """
@@ -17,8 +15,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import hmac
 import inspect
 import json
 import logging
@@ -29,7 +25,6 @@ import signal
 import ssl
 import subprocess
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +38,67 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 LOGGER = logging.getLogger("swarm")
+
+# Same sun-position model used by the trust engine physical cap (keep the constants aligned)
+NIGHT_ELEVATION_DEG = -2.0
+MAX_DIFFUSE_WM2 = 120.0
+
+
+def solar_elevation_deg(ts: int, latitude: float, longitude: float) -> float:
+    """Solar elevation angle in degrees at UTC timestamp ts (NOAA approximation)."""
+    lat = math.radians(latitude)
+    utc = time.gmtime(ts)
+    hour = utc.tm_hour + utc.tm_min / 60.0 + utc.tm_sec / 3600.0
+    gamma = 2.0 * math.pi / 365.0 * (utc.tm_yday - 1 + (hour - 12.0) / 24.0)
+
+    eq_time_min = 229.18 * (0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
+                            - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma))
+    declination = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+                   - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma)
+                   - 0.002697 * math.cos(3 * gamma) + 0.00148 * math.sin(3 * gamma))
+
+    hour_angle = math.radians((hour * 60.0 + eq_time_min + 4.0 * longitude) / 4.0 - 180.0)
+    cos_zenith = (math.sin(lat) * math.sin(declination)
+                  + math.cos(lat) * math.cos(declination) * math.cos(hour_angle))
+    return 90.0 - math.degrees(math.acos(max(-1.0, min(1.0, cos_zenith))))
+
+
+# Open-Meteo "current" data changes every 15 minutes: devices and trust engine refresh
+# on the same clock-aligned slots, so that they read the same forecast value
+FORECAST_SLOT_SECONDS = 900
+KC_MIN_CLEAR_GHI = 50.0
+KC_MAX = 1.2
+
+
+def clear_sky_ghi_wm2(elevation_deg: float) -> float:
+    """Clear-sky global horizontal irradiance (Haurwitz model), same as the trust engine."""
+    if elevation_deg <= 0:
+        return 0.0
+    sin_elevation = math.sin(math.radians(elevation_deg))
+    return 1098.0 * sin_elevation * math.exp(-0.057 / sin_elevation)
+
+
+def sky_index_from_yield(yield_pct: float, ref_ts: float, latitude: float, longitude: float) -> float | None:
+    """Clear-sky index kc = forecast / clear sky; None when the sun is too low to judge the sky."""
+    clear = clear_sky_ghi_wm2(solar_elevation_deg(int(ref_ts), latitude, longitude))
+    if clear < KC_MIN_CLEAR_GHI:
+        return None
+    return min(KC_MAX, yield_pct * 1000.0 / clear)
+
+
+def physical_yield_limit(ts: int, latitude: float, longitude: float) -> float:
+    """
+    Highest yield (fraction of the peak power) that the sun position allows: a simulated
+    meter must never report more, even when the cached forecast is stale after sunset.
+    """
+    elevation = solar_elevation_deg(ts, latitude, longitude)
+    if elevation <= NIGHT_ELEVATION_DEG:
+        return 0.0
+    zenith = min(90.0 - elevation, 96.0)
+    air_mass = 1.0 / (math.cos(math.radians(zenith)) + 0.50572 * (96.07995 - zenith) ** -1.6364)
+    direct_normal = 1353.0 * 0.7 ** (air_mass ** 0.678)
+    diffuse = MAX_DIFFUSE_WM2 * min(1.0, (elevation - NIGHT_ELEVATION_DEG) / 10.0)
+    return (1.1 * direct_normal + diffuse) / 1000.0
 
 @dataclass(slots=True)
 class SimulationConfig:
@@ -64,13 +120,14 @@ class SimulationConfig:
     forecast_api_url: str
     forecast_latitude: float
     forecast_longitude: float
-    forecast_cache_seconds: float
     forecast_timeout_seconds: float
     use_forecast_api: bool
     fallback_sunrise_hour: float
     fallback_sunset_hour: float
     fallback_peak_irradiance_wm2: float
     runtime_dir: Path
+    nominal_peak_min_watt: float
+    nominal_peak_max_watt: float
 
 @dataclass(slots=True)
 class DeviceRuntimeState:
@@ -84,7 +141,8 @@ class DeviceRuntimeState:
 class WeatherRuntimeState:
     """Shared runtime state for weather conditions."""
     cached_yield_percentage: float | None = None
-    cached_at_monotonic: float = 0.0
+    cached_slot: int | None = None
+    sky_index: float | None = None
     source: str = "fallback"
 
 class SwarmWeatherService:
@@ -97,42 +155,53 @@ class SwarmWeatherService:
         self._lock = asyncio.Lock()
 
     async def get_yield_percentage(self, now_ts: int) -> float:
-        """Fetch or calculate the current yield percentage based on the cache or an API call."""
-        now_monotonic = time.monotonic()
-        # Return cached value if it is still valid
-        if self._is_cache_fresh(now_monotonic):
+        """
+        Current yield percentage. The forecast is refreshed once per clock-aligned slot
+        (15 minutes, like the trust engine), and between refreshes the sky condition (kc)
+        is carried along the sun position, as a real panel would follow the sun
+        """
+        slot = int(now_ts // FORECAST_SLOT_SECONDS)
+        if self.state.cached_slot != slot:
+            async with self._lock:
+                # Double check within the lock in case another task updated the cache
+                if self.state.cached_slot != slot:
+                    await self._refresh(now_ts, slot)
+
+        if self.state.source == "fallback":
+            # Deterministic function of time, identical to the trust engine fallback
+            return self._build_gateway_compatible_fallback(now_ts)
+        if self.state.sky_index is None:
+            # Sun too low at refresh time to judge the sky: keep the raw (lower) value
             return float(self.state.cached_yield_percentage)
+        clear_yield = clear_sky_ghi_wm2(
+            solar_elevation_deg(now_ts, self.config.forecast_latitude, self.config.forecast_longitude)
+        ) / 1000.0
+        return min(1.0, self.state.sky_index * clear_yield)
 
-        async with self._lock:
-            # Double check within the lock in case another task updated the cache
-            now_monotonic = time.monotonic()
-            if self._is_cache_fresh(now_monotonic):
-                return float(self.state.cached_yield_percentage)
+    async def _refresh(self, now_ts: int, slot: int) -> None:
+        """Fetch the forecast for the new slot, or switch to the mathematical fallback."""
+        if self.config.use_forecast_api:
+            try:
+                yield_pct = await self._fetch_open_meteo_yield_percentage()
+                # Open-Meteo current is the average of the previous 15 minutes
+                ref_ts = now_ts - FORECAST_SLOT_SECONDS / 2
+                sky_index = sky_index_from_yield(
+                    yield_pct, ref_ts, self.config.forecast_latitude, self.config.forecast_longitude
+                )
+                self._update_cache(yield_pct, slot, sky_index, source="open-meteo")
+                LOGGER.debug("Weather refresh from Open-Meteo: yield=%.3f kc=%s", yield_pct, sky_index)
+                return
+            except Exception as exc:
+                LOGGER.warning("Forecast API unavailable, using mathematical fallback: %s", exc)
 
-            if self.config.use_forecast_api:
-                try:
-                    yield_pct = await self._fetch_open_meteo_yield_percentage()
-                    self._update_cache(yield_pct, now_monotonic, source="open-meteo")
-                    LOGGER.debug("Weather refresh from Open-Meteo: expected_yield=%.3f", yield_pct)
-                    return yield_pct
-                except Exception as exc:
-                    LOGGER.warning("Forecast API unavailable, using mathematical fallback: %s", exc)
+        # Use mathematical fallback if the API fails or is disabled
+        self._update_cache(0.0, slot, None, source="fallback")
 
-            # Use mathematical fallback if the API fails or is disabled
-            yield_pct = self._build_gateway_compatible_fallback(now_ts)
-            self._update_cache(yield_pct, now_monotonic, source="fallback")
-            return yield_pct
-
-    def _is_cache_fresh(self, now_monotonic: float) -> bool:
-        """Check if the cached weather data is still within its TTL."""
-        if self.state.cached_yield_percentage is None:
-            return False
-        return (now_monotonic - self.state.cached_at_monotonic) < self.config.forecast_cache_seconds
-
-    def _update_cache(self, yield_pct: float, now_monotonic: float, source: str) -> None:
-        """Update the shared cache with a new yield percentage."""
+    def _update_cache(self, yield_pct: float, slot: int, sky_index: float | None, source: str) -> None:
+        """Update the shared cache for the current slot."""
         self.state.cached_yield_percentage = max(0.0, min(1.0, float(yield_pct)))
-        self.state.cached_at_monotonic = now_monotonic
+        self.state.cached_slot = slot
+        self.state.sky_index = sky_index
         self.state.source = source
 
     async def _fetch_open_meteo_yield_percentage(self) -> float:
@@ -202,12 +271,25 @@ class SimulatedDevice:
         self.private_key: ec.EllipticCurvePrivateKey | None = None
         self.device_cert_pem: str | None = None
         self.ca_cert_pem: str | None = None
-        self.hmac_key: bytes | None = None
+        self._last_sequence = 0
         self.runtime_paths = self._build_runtime_paths()
 
         self.state = DeviceRuntimeState(
-            nominal_peak_watt=random.uniform(2200.0, 3600.0),
+            nominal_peak_watt=self._sample_nominal_peak_watt(),
         )
+
+    def _sample_nominal_peak_watt(self) -> float:
+        """Sample nominal peak power from configured bounds"""
+        low = float(self.config.nominal_peak_min_watt)
+        high = float(self.config.nominal_peak_max_watt)
+
+        if high < low:
+            low, high = high, low
+
+        if abs(high - low) < 1e-9:
+            return low
+
+        return random.uniform(low, high)
 
     async def run(self) -> None:
         """Main lifecycle loop of the simulated device."""
@@ -249,7 +331,7 @@ class SimulatedDevice:
             "device_id": self.device_id,
             "csr": csr_pem,
             "peak_power": int(round(self.state.nominal_peak_watt)),
-            "bootstrap_token": f"token-{self.device_id}"  # <-- INIEZIONE TOKEN
+            "bootstrap_token": f"token-{self.device_id}",  # pre-seeded by seed_simulator_tokens()
         }
 
         request_ssl = self._build_enrollment_ssl_context()
@@ -283,13 +365,6 @@ class SimulatedDevice:
         self.device_cert_pem = certificate
         self.ca_cert_pem = ca_certificate
 
-        # If the backend also exposes an HMAC key, use HMAC-SHA256.
-        hmac_value = data.get("hmac_key")
-        if isinstance(hmac_value, str) and hmac_value.strip():
-            self.hmac_key = self._normalize_hmac_key(hmac_value)
-        else:
-            self.hmac_key = None
-
         self._write_tls_material_to_disk()
 
     async def _telemetry_loop(self) -> None:
@@ -304,10 +379,9 @@ class SimulatedDevice:
                     
                     try:
                         publish_count = 0
-                        seq_counter = 1
 
                         while not self.stop_event.is_set():
-                            base_payload = await self._build_telemetry_payload(seq_counter)
+                            base_payload = await self._build_telemetry_payload(self._next_sequence())
                             signature = self._sign_payload(base_payload)
                             
                             full_payload = {
@@ -327,7 +401,6 @@ class SimulatedDevice:
                             )
 
                             publish_count += 1
-                            seq_counter += 1
 
                             if publish_count == 1:
                                 LOGGER.info(
@@ -354,10 +427,21 @@ class SimulatedDevice:
                 LOGGER.warning("[%s] MQTT error/timeout: %s", self.device_id, exc)
                 await self._sleep_with_jitter(self.config.reconnect_delay_seconds)
 
+    def _next_sequence(self) -> int:
+        """
+        Anti-replay sequence, strictly increasing across MQTT reconnections and simulator restarts
+        """
+        self._last_sequence = max(self._last_sequence + 1, time.time_ns() // 1_000_000)
+        return self._last_sequence
+
     async def _build_telemetry_payload(self, seq_counter: int) -> dict[str, Any]:
         """Construct the un-signed telemetry payload."""
         now_ts = int(time.time())
         yield_percentage = await self.weather_service.get_yield_percentage(now_ts)
+        yield_percentage = min(
+            yield_percentage,
+            physical_yield_limit(now_ts, self.config.forecast_latitude, self.config.forecast_longitude),
+        )
 
         # Consistent with trust engine: expected_production = peak_power * expected_yield.
         production_watt = self.state.nominal_peak_watt * yield_percentage
@@ -376,12 +460,9 @@ class SimulatedDevice:
         }
 
     def _sign_payload(self, payload_without_sig: dict[str, Any]) -> str:
-        """Sign the payload using either HMAC (if available) or ECDSA."""
+        """Sign the payload with the device ECDSA key."""
         payload_str = json.dumps(payload_without_sig, separators=(",", ":"), ensure_ascii=True)
         payload_bytes = payload_str.encode("utf-8")
-
-        if self.hmac_key is not None:
-            return hmac.new(self.hmac_key, payload_bytes, hashlib.sha256).hexdigest()
 
         if self.private_key is None:
             raise RuntimeError("Private key not initialized")
@@ -519,15 +600,6 @@ class SimulatedDevice:
         """Check if this device has completely finished its enrollment process."""
         return self.private_key is not None and self.device_cert_pem is not None and self.ca_cert_pem is not None
 
-    @staticmethod
-    def _normalize_hmac_key(hmac_value: str) -> bytes:
-        """Convert an incoming HMAC key string into bytes appropriately."""
-        value = hmac_value.strip()
-        try:
-            return bytes.fromhex(value)
-        except ValueError:
-            return value.encode("utf-8")
-        
     async def _listen_for_blocks(self, mqtt_client: aiomqtt.Client) -> None:
         """Asynchronously listen for new block hashes from the Gateway."""
         try:
@@ -540,7 +612,7 @@ class SimulatedDevice:
                     latest_tx_node = payload.get("latestTxNode", "")
                     
                     LOGGER.debug(
-                        "[%s] Blockchain Sync! Blocco #%d | Hash: %s... | Tx di: %s",
+                        "[%s] Blockchain sync! Block #%d | Hash: %s... | Tx from: %s",
                         self.device_id,
                         self.state.latest_block_number,
                         self.state.latest_block_hash[:10],
@@ -554,7 +626,7 @@ class SimulatedDevice:
 
 def build_device_id(index: int) -> str:
     """Generate a deterministic ID for a simulated device."""
-    # Rimosso lo UUID casuale per permettere il pre-seeding deterministico dei token in SQLite.
+    # Deterministic IDs, so that the bootstrap tokens can be pre-seeded in SQLite
     return f"SimMeter_{index:04d}"
 
 
@@ -621,7 +693,7 @@ async def run_swarm(config: SimulationConfig, device_count: int) -> None:
     timeout = aiohttp.ClientTimeout(total=config.enrollment_timeout_seconds)
     
     LOGGER.info(
-        "Starting simulation: devices=%d enroll=%s mqtt=%s:%d topic=%s interval=%.1fs jitter=%.0f%% weather=%s(%.4f,%.4f)",
+        "Starting simulation: devices=%d enroll=%s mqtt=%s:%d topic=%s interval=%.1fs jitter=%.0f%% weather=%s(%.4f,%.4f) nominal_peak=[%.1f, %.1f]W",
         device_count,
         config.enroll_url,
         config.mqtt_host,
@@ -632,6 +704,8 @@ async def run_swarm(config: SimulationConfig, device_count: int) -> None:
         "open-meteo" if config.use_forecast_api else "fallback",
         config.forecast_latitude,
         config.forecast_longitude,
+        config.nominal_peak_min_watt,
+        config.nominal_peak_max_watt,
     )
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -711,7 +785,6 @@ async def async_main() -> None:
     parser.add_argument("--jitter", type=float, default=None, help="Relative jitter (0.10 = +/-10%%)")
     parser.add_argument("--forecast-lat", type=float, default=None, help="Latitude for Open-Meteo")
     parser.add_argument("--forecast-lon", type=float, default=None, help="Longitude for Open-Meteo")
-    parser.add_argument("--forecast-cache-seconds", type=float, default=None, help="Shared forecast cache TTL")
     parser.add_argument("--forecast-timeout-seconds", type=float, default=None, help="Open-Meteo request timeout")
     parser.add_argument("--forecast-api-url", type=str, default=None, help="Forecast API endpoint")
     parser.add_argument(
@@ -770,13 +843,14 @@ async def async_main() -> None:
         forecast_api_url=pick("SWARM_FORECAST_API_URL", args.forecast_api_url, str),
         forecast_latitude=pick("SWARM_FORECAST_LATITUDE", args.forecast_lat, float),
         forecast_longitude=pick("SWARM_FORECAST_LONGITUDE", args.forecast_lon, float),
-        forecast_cache_seconds=pick("SWARM_FORECAST_CACHE_SECONDS", args.forecast_cache_seconds, float),
         forecast_timeout_seconds=pick("SWARM_FORECAST_TIMEOUT_SECONDS", args.forecast_timeout_seconds, float),
         use_forecast_api=use_forecast_api,
         fallback_sunrise_hour=pick("SWARM_FALLBACK_SUNRISE_HOUR", args.fallback_sunrise, float),
         fallback_sunset_hour=pick("SWARM_FALLBACK_SUNSET_HOUR", args.fallback_sunset, float),
         fallback_peak_irradiance_wm2=pick("SWARM_FALLBACK_PEAK_IRRADIANCE_WM2", args.fallback_peak_irradiance, float),
         runtime_dir=pick("SWARM_RUNTIME_DIR", args.runtime_dir, Path),
+        nominal_peak_min_watt=float(env_value("SWARM_NOMINAL_PEAK_MIN_WATT") or "3000.0"),
+        nominal_peak_max_watt=float(env_value("SWARM_NOMINAL_PEAK_MAX_WATT") or "3000.0"),
     )
 
     await run_swarm(config=config, device_count=device_count)
