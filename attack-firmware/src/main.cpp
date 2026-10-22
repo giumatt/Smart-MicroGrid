@@ -83,22 +83,8 @@ void setup() {
                 break;
             }
 
-            // Decide retry delay based on the last HTTP code printed by provisioning_client
-            // The provisioning client prints: [PROV] RESULT_HTTP_CODE=<n>
-            // If code is 4xx, slow retry.
-            //
-            // NOTE: We also support a direct accessor if present.
-            int lastCode = -1;
-#if defined(__has_include)
-    #if __has_include("provisioning_client.h")
-        // If provisioning_client exposes getLastProvisioningHttpCode(), use it.
-        // (Safe even if not declared? It must be declared in header to compile.)
-    #endif
-#endif
-
-            // If you add the prototype `int getLastProvisioningHttpCode();` to the header,
-            // uncomment the following line:
-            lastCode = getLastProvisioningHttpCode();
+            // A 4xx means a client/payload problem: retry slowly
+            int lastCode = getLastProvisioningHttpCode();
 
             retries--;
 

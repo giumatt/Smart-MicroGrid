@@ -17,6 +17,7 @@ static const char* NVS_NAMESPACE = "iot_secure";
 static const char* KEY_TAG      = "ecdsa_priv";  // PEM
 static const char* CERT_TAG     = "x509_cert";   // PEM
 static const char* CA_CERT_TAG  = "ca_cert";     // PEM
+static const char* SEQ_TAG = "seq_counter";
 
 // ============================================================================
 // Global Contexts
@@ -245,23 +246,42 @@ String getPublicKeyHex() {
     return hex;
 }
 
-uint32_t getNextSequence() {
-    nvs_handle_t handle;
-    uint32_t seq = 0;
+static const uint32_t SEQ_PERSIST_BLOCK = 100;
+static uint32_t seq_current  = 0;
+static uint32_t seq_reserved = 0;   // highest value already persisted (0 = not loaded yet)
 
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        Serial.println("[SECURITY] NVS open failed for sequence counter");
-        return 0;
+static bool persistSequence(uint32_t value) {
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t err = nvs_set_u32(handle, SEQ_TAG, value);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return (err == ESP_OK);
+}
+
+uint32_t getNextSequence() {
+    if (seq_reserved == 0) {
+        // First call after boot: resume from the last reserved value (0 if never stored)
+        nvs_handle_t handle;
+        uint32_t stored = 0;
+        if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+            nvs_get_u32(handle, SEQ_TAG, &stored);
+            nvs_close(handle);
+        }
+        seq_current = stored;
     }
 
-    nvs_get_u32(handle, SEQ_TAG, &seq);   // if doesn't exists stays 0
-    seq += 1;
-    nvs_set_u32(handle, SEQ_TAG, seq);
-    nvs_commit(handle);
-    nvs_close(handle);
+    if (seq_current >= seq_reserved) {
+        uint32_t next_reserved = seq_current + SEQ_PERSIST_BLOCK;
+        if (!persistSequence(next_reserved)) {
+            // Without a persisted reservation a reboot could reuse sequences
+            Serial.println("[SECURITY] ERROR: cannot persist the sequence counter");
+            return 0;
+        }
+        seq_reserved = next_reserved;
+    }
 
-    return seq;
+    return ++seq_current;
 }
 
 // ============================================================================
