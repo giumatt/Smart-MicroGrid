@@ -4,7 +4,8 @@ services:
     image: eclipse-mosquitto:latest
     container_name: mqtt_broker
     ports:
-      - "1883:1883"
+      # Anonymous, ACL-free listener: reachable from this host only
+      - "127.0.0.1:1883:1883"
       - "8883:8883"
     volumes:
       - ./mosquitto/config:/mosquitto/config
@@ -119,7 +120,7 @@ services:
     environment:
       - WEB3_PROVIDER_URI=http://evm_node:8545
     volumes:
-      - ./src/blockchain/EnergyLedger.sol:/app/EnergyLedger.sol:ro # Monta lo smart contract
+      - ./src/blockchain/EnergyLedger.sol:/app/EnergyLedger.sol:ro
       - ./certs:/app/certs:ro
       - db_volume:/app/data:ro
     depends_on:

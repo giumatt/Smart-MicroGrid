@@ -7,9 +7,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CA_DIR = PROJECT_ROOT / "src" / "ca"
 PROVISIONING_DIR = PROJECT_ROOT / "src" / "provisioning"
 TRUST_ENGINE_DIR = PROJECT_ROOT / "src" / "trust_engine"
+BLOCKCHAIN_DIR = PROJECT_ROOT / "src" / "blockchain"
 
 if str(CA_DIR) not in sys.path:
     sys.path.insert(0, str(CA_DIR))
+
+if str(BLOCKCHAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BLOCKCHAIN_DIR))
 
 if str(PROVISIONING_DIR) not in sys.path:
     sys.path.insert(0, str(PROVISIONING_DIR))

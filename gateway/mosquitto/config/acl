@@ -7,7 +7,10 @@ topic readwrite #
 
 user blockchain
 topic read microgrid/transfers/#
+topic write microgrid/blocks/latest
 
 # Sensors with client certificates
 pattern readwrite microgrid/production
 pattern readwrite microgrid/production/%u
+# Light-client block announcements published by the blockchain relayer
+pattern read microgrid/blocks/latest

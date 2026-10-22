@@ -3,3 +3,4 @@ influxdb-client>=1.50.0,<2.0.0
 cryptography>=46.0.0,<47.0.0
 requests>=2.32.0,<3.0.0
 prometheus-client>=0.20.0
+tzdata>=2024.1

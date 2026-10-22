@@ -114,7 +114,7 @@ def test_init_database_creates_devices_and_tokens_table(provisioner_paths):
 def test_store_device_public_key_upsert(provisioner_paths):
     provisioner.init_database()
     
-    # Inserimento token manuale per i test
+    # Insert the test tokens manually
     with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
         conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-1', 'node-1')")
         conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-2', 'node-1')")
@@ -129,16 +129,52 @@ def test_store_device_public_key_upsert(provisioner_paths):
             ("node-1",),
         ).fetchone()
         
-        # Verifica che entrambi i token siano stati marcati come usati
+        # Both tokens must be marked as used
         token1_used = conn.execute("SELECT used FROM bootstrap_tokens WHERE token = 'token-1'").fetchone()[0]
         token2_used = conn.execute("SELECT used FROM bootstrap_tokens WHERE token = 'token-2'").fetchone()[0]
 
-    assert row == ("PUBKEY-B", 100.0, 0, 3200.0)
+    # Re-enrollment rotates the key but keeps the registered peak power
+    assert row == ("PUBKEY-B", 100.0, 0, 2500.0)
     assert token1_used == 1
     assert token2_used == 1
 
+def test_store_device_public_key_peak_power_rules(provisioner_paths, monkeypatch):
+    provisioner.init_database()
+    monkeypatch.setattr(provisioner, "MAX_PEAK_POWER_WATTS", 10000.0)
+
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id, peak_power) VALUES ('token-op', 'node-op', 4000.0)")
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-big', 'node-big')")
+        conn.commit()
+
+    # The operator-assigned value wins over the declared one
+    provisioner._store_device_public_key("node-op", "PUBKEY", 9000.0, "token-op")
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        peak = conn.execute("SELECT peak_power FROM devices WHERE node_id = 'node-op'").fetchone()[0]
+    assert peak == 4000.0
+
+    with pytest.raises(provisioner.InputValidationError, match="maximum allowed"):
+        provisioner._store_device_public_key("node-big", "PUBKEY", 50000.0, "token-big")
+
+def test_store_device_public_key_unassigned_token_cannot_take_over(provisioner_paths):
+    provisioner.init_database()
+
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('token-a', 'node-1')")
+        conn.execute("INSERT INTO bootstrap_tokens (token) VALUES ('token-generic')")
+        conn.commit()
+
+    provisioner._store_device_public_key("node-1", "PUBKEY-LEGIT", 3000.0, "token-a")
+
+    with pytest.raises(provisioner.InputValidationError, match="already enrolled"):
+        provisioner._store_device_public_key("node-1", "PUBKEY-EVIL", 3000.0, "token-generic")
+
+    with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
+        public_key = conn.execute("SELECT public_key FROM devices WHERE node_id = 'node-1'").fetchone()[0]
+    assert public_key == "PUBKEY-LEGIT"
+
 def test_store_device_public_key_token_rules(provisioner_paths):
-    """Testa le difese contro Identity Hijacking e furto token"""
+    """Defenses against identity hijacking and token theft"""
     provisioner.init_database()
     
     with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
@@ -146,15 +182,15 @@ def test_store_device_public_key_token_rules(provisioner_paths):
         conn.execute("INSERT INTO bootstrap_tokens (token, node_id, used) VALUES ('token-used', 'node-B', 1)")
         conn.commit()
 
-    # 1. Token non esistente
+    # 1. Unknown token
     with pytest.raises(provisioner.InputValidationError, match="Invalid bootstrap token"):
         provisioner._store_device_public_key("node-1", "PUBKEY", 3000.0, "token-fake")
 
-    # 2. Token già usato
+    # 2. Token already used
     with pytest.raises(provisioner.InputValidationError, match="already been used"):
         provisioner._store_device_public_key("node-B", "PUBKEY", 3000.0, "token-used")
 
-    # 3. Token assegnato ad un altro nodo
+    # 3. Token assigned to another node
     with pytest.raises(provisioner.InputValidationError, match="different device"):
         provisioner._store_device_public_key("node-X", "PUBKEY", 3000.0, "token-assigned")
 
@@ -193,7 +229,7 @@ def test_parse_enroll_payload_accepts_valid_json():
         ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "bootstrap_token": "t"}, "peak_power"),
         ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": "3kW", "bootstrap_token": "t"}, "peak_power"),
         ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 0, "bootstrap_token": "t"}, "greater than 0"),
-        # Nuovi check sul token
+        # Token checks
         ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000}, "bootstrap_token"),
         ({"device_id": "device-1", "csr": "-----BEGIN CERTIFICATE REQUEST-----X", "peak_power": 3000, "bootstrap_token": ""}, "bootstrap_token"),
     ],
@@ -239,7 +275,7 @@ def test_enroll_success_returns_cert_and_persists_device(provisioner_paths, flas
     _, ca_cert = _write_ca_material(provisioner_paths["ca_key_path"], provisioner_paths["ca_cert_path"])
     provisioner.init_database()
     
-    # Inserimento token per il test
+    # Insert the test token
     with closing(sqlite3.connect(provisioner.DB_PATH)) as conn:
         conn.execute("INSERT INTO bootstrap_tokens (token, node_id) VALUES ('valid-token-123', 'device-123')")
         conn.commit()

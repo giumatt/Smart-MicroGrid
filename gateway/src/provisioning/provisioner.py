@@ -41,6 +41,7 @@ CLOCK_SKEW_SECONDS = int(os.getenv("CERT_CLOCK_SKEW_SECONDS", "7200"))
 MIN_RSA_KEY_BITS = int(os.getenv("MIN_RSA_KEY_BITS", "2048"))
 MIN_EC_KEY_BITS = int(os.getenv("MIN_EC_KEY_BITS", "256"))
 DEFAULT_PEAK_POWER_WATTS = float(os.getenv("DEFAULT_PEAK_POWER_WATTS", "3000.0"))
+MAX_PEAK_POWER_WATTS = float(os.getenv("MAX_PEAK_POWER_WATTS", "20000.0"))
 
 CA_CERT_PATH = os.path.join(CERTS_PATH, "ca.crt")
 CA_KEY_PATH = os.path.join(CERTS_PATH, "ca.key")
@@ -162,23 +163,41 @@ def _store_device_public_key(device_id: str, public_key_pem: str, peak_power: fl
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cursor = conn.cursor()
         
-        # 1. Verifica del Token
-        cursor.execute("SELECT used, node_id FROM bootstrap_tokens WHERE token = ?", (token,))
+        # 1. Validate the token
+        cursor.execute("SELECT used, node_id, peak_power FROM bootstrap_tokens WHERE token = ?", (token,))
         row = cursor.fetchone()
-        
+
         if not row:
             raise InputValidationError("Invalid bootstrap token")
-            
-        used, assigned_node_id = row
+
+        used, assigned_node_id, token_peak_power = row
         if used == 1:
             raise InputValidationError("Bootstrap token has already been used")
         if assigned_node_id and assigned_node_id != device_id:
             raise InputValidationError("Bootstrap token is assigned to a different device")
-            
-        # 2. Brucia il token associandolo definitivamente al dispositivo
+
+        cursor.execute("SELECT peak_power FROM devices WHERE node_id = ?", (device_id,))
+        existing = cursor.fetchone()
+
+        # An unassigned token may enroll new devices only: re-keying an existing node_id
+        # with it would let anyone holding a generic token take over that identity.
+        if existing and not assigned_node_id:
+            raise InputValidationError("Device already enrolled: re-enrollment requires a token assigned to it")
+
+        # The peak power drives the Trust Engine overproduction bound, so the value declared
+        # by the device is only a fallback: the one set on the token by the operator wins,
+        # and a re-enrollment keeps the registered value.
+        if token_peak_power:
+            peak_power = float(token_peak_power)
+        elif existing and existing[0]:
+            peak_power = float(existing[0])
+        if peak_power > MAX_PEAK_POWER_WATTS:
+            raise InputValidationError(f"peak_power exceeds the maximum allowed ({MAX_PEAK_POWER_WATTS:.0f} W)")
+
+        # 2. Burn the token, binding it permanently to the device
         cursor.execute("UPDATE bootstrap_tokens SET used = 1, node_id = ? WHERE token = ?", (device_id, token))
 
-        # 3. Salva la chiave pubblica del dispositivo
+        # 3. Store the device public key
         cursor.execute('''
             INSERT INTO devices (node_id, public_key, trust_score, status, peak_power)
             VALUES (?, ?, 100, 0, ?)
@@ -207,16 +226,22 @@ def init_database():
                     peak_power REAL DEFAULT 3000.0
                 )
             ''')
-            # --- TABELLA TOKEN ---
+            # --- BOOTSTRAP TOKENS ---
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS bootstrap_tokens (
                     token TEXT PRIMARY KEY,
                     node_id TEXT,
                     used INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    peak_power REAL
                 )
             ''')
-            # Generazione automatica di token di test per la tesi
+            # Operator-assigned peak power (overrides the value declared by the device)
+            try:
+                cursor.execute("ALTER TABLE bootstrap_tokens ADD COLUMN peak_power REAL")
+            except sqlite3.OperationalError:
+                pass
+            # Demo tokens for the physical ESP32 devices
             cursor.execute("INSERT OR IGNORE INTO bootstrap_tokens (token, node_id) VALUES ('token-ESP', 'SmartMeter_ESP')")
             cursor.execute("INSERT OR IGNORE INTO bootstrap_tokens (token, node_id) VALUES ('token-001', 'SmartMeter_001')")
             
@@ -256,7 +281,6 @@ def get_ca_credentials():
 def enroll():
     PROV_ENROLL_REQUESTS.inc()
     try:
-        # ---> RIGA CORRETTA: Ora spacchettiamo 4 valori <---
         device_id, csr_pem, peak_power, bootstrap_token = _parse_enroll_payload(request)
         
         ca_cert, ca_key = get_ca_credentials()
@@ -273,7 +297,7 @@ def enroll():
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode()
         
-        # Passiamo il token alla funzione del database
+        # Burns the bootstrap token in the same transaction
         _store_device_public_key(device_id, public_key_pem, peak_power, bootstrap_token)
         
         logger.info(f"[PROVISION] Device {device_id} enrolled successfully")

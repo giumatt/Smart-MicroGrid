@@ -1,3 +1,4 @@
+import calendar
 import importlib
 import json
 import sqlite3
@@ -21,15 +22,14 @@ class _FakeWriteAPI:
         self.calls.append(kwargs)
 
 class _FakeRecord:
-    def __init__(self, measurement, value):
-        self._measurement = measurement
-        self._value = value
-
-    def get_measurement(self):
-        return self._measurement
+    """Mirrors influxdb_client FluxRecord: the yield() name lives in the "result" column."""
+    def __init__(self, result, value, node_id=None):
+        self.values = {"result": result, "_measurement": "production", "_value": value}
+        if node_id is not None:
+            self.values["node_id"] = node_id
 
     def get_value(self):
-        return self._value
+        return self.values["_value"]
 
 class _FakeTable:
     def __init__(self, records):
@@ -94,9 +94,14 @@ class _FakeResponse:
 class _FakeMqttClient:
     def __init__(self):
         self.subscribed_topics = []
+        self.published = []
 
     def subscribe(self, topic):
         self.subscribed_topics.append(topic)
+
+    def publish(self, topic, payload):
+        self.published.append((topic, json.loads(payload)))
+        return types.SimpleNamespace(rc=0)
 
 class _ReasonCode:
     def __init__(self, value=None, rc=None, is_failure=None):
@@ -179,9 +184,16 @@ def test_check_device_status_and_ban(trust_engine_module):
 
     with closing(sqlite3.connect(trust_engine_module.DB_PATH)) as conn:
         cursor = conn.cursor()
-        assert trust_engine_module.check_device_status(cursor, "missing") == (None, None, None, None, None)
-        assert trust_engine_module.check_device_status(cursor, "node-ok") == (0, 88.0, 3500.0, 0, 0)
-        assert trust_engine_module.check_device_status(cursor, "node-bad") == (1, 100.0, 3000.0, 0, 0)
+        assert trust_engine_module.get_device(cursor, "missing") is None
+
+        device_ok = trust_engine_module.get_device(cursor, "node-ok")
+        assert (device_ok["status"], device_ok["trust_score"], device_ok["peak_power"]) == (0, 88.0, 3500.0)
+        assert (device_ok["recent_violations"], device_ok["last_sequence"]) == (0, 0)
+        assert device_ok["observation_state"] is None
+        assert device_ok["last_energy_ts"] is None
+
+        device_bad = trust_engine_module.get_device(cursor, "node-bad")
+        assert (device_bad["status"], device_bad["trust_score"]) == (1, 100.0)
 
         trust_engine_module.ban_device(cursor, "node-ok")
         conn.commit()
@@ -200,31 +212,47 @@ def test_verify_integrity_success_and_failure(trust_engine_module):
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
 
-    _insert_device(trust_engine_module, "node-1", public_key=public_key_pem)
-
     data = {"node_id": "node-1", "timestamp": 123, "production": 12.5}
     payload_str = json.dumps(data, separators=(",", ":"))
     valid_signature = private_key.sign(payload_str.encode(), ec.ECDSA(hashes.SHA256())).hex()
+    raw = payload_str[:-1] + f',"sig":"{valid_signature}"}}'
 
-    assert trust_engine_module.verify_integrity(data, valid_signature, "node-1") is True
-    assert trust_engine_module.verify_integrity(data, "deadbeef", "node-1") is False
-    assert trust_engine_module.verify_integrity(data, valid_signature, "missing-node") is False
+    assert trust_engine_module.verify_integrity(public_key_pem, valid_signature, raw, data) == payload_str.encode()
+    assert trust_engine_module.verify_integrity(public_key_pem, "deadbeef", raw, data) is None
+    assert trust_engine_module.verify_integrity(None, valid_signature, raw, data) is None
+
+def test_verify_integrity_uses_raw_bytes_for_firmware_floats(trust_engine_module):
+    # The firmware serializes production with 2 decimals: re-serializing in Python gives 1234.5
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+
+    signed = '{"node_id":"node-1","timestamp":123,"seq":7,"production":1234.50}'
+    signature = private_key.sign(signed.encode(), ec.ECDSA(hashes.SHA256())).hex()
+    raw = signed[:-1] + f',"sig":"{signature}"}}'
+    data = json.loads(raw)
+    data.pop("sig")
+
+    assert trust_engine_module.verify_integrity(public_key_pem, signature, raw, data) == signed.encode()
+
+def test_extract_signed_bytes_requires_a_single_sig_member(trust_engine_module):
+    assert trust_engine_module.extract_signed_bytes('{"a":1,"sig":"ab"}') == b'{"a":1}'
+    assert trust_engine_module.extract_signed_bytes('{"a":1}') is None
+    assert trust_engine_module.extract_signed_bytes('{"a":1,"sig":"ab","sig":"cd"}') is None
 
 # --- TEST FORECAST AND API ---
 def test_get_fallback_yield_night_and_day(trust_engine_module, monkeypatch):
-    monkeypatch.setattr(
-        trust_engine_module.time,
-        "localtime",
-        lambda _: time.struct_time((2026, 4, 22, 2, 0, 0, 0, 0, -1)),
-    )
-    assert trust_engine_module.get_fallback_yield() == 0.0
+    monkeypatch.setattr(trust_engine_module, "FALLBACK_TIMEZONE", "Europe/Rome")
 
-    monkeypatch.setattr(
-        trust_engine_module.time,
-        "localtime",
-        lambda _: time.struct_time((2026, 4, 22, 12, 0, 0, 0, 0, -1)),
-    )
-    assert trust_engine_module.get_fallback_yield() > 0.0
+    # 2026-04-22 00:00 UTC = 02:00 in Rome (CEST)
+    night_ts = calendar.timegm((2026, 4, 22, 0, 0, 0))
+    assert trust_engine_module.get_fallback_yield(night_ts) == 0.0
+
+    # 2026-04-22 10:00 UTC = 12:00 in Rome: peak of the sinusoid
+    noon_ts = calendar.timegm((2026, 4, 22, 10, 0, 0))
+    assert trust_engine_module.get_fallback_yield(noon_ts) == pytest.approx(1.0)
 
 def test_get_current_forecast_updates_cache_on_api_success(trust_engine_module, monkeypatch):
     trust_engine_module.forecast_cache = {"timestamp": 0, "yield_percentage": 0.0}
@@ -238,7 +266,8 @@ def test_get_current_forecast_updates_cache_on_api_success(trust_engine_module, 
     assert trust_engine_module.forecast_cache["timestamp"] == 2000.0
 
 def test_get_current_forecast_uses_cache_without_new_http_call(trust_engine_module, monkeypatch):
-    trust_engine_module.forecast_cache = {"timestamp": 1900.0, "yield_percentage": 0.77}
+    # Same 15-minute slot (2000 // 900 == 1900 // 900): no new request
+    trust_engine_module.forecast_cache = {"timestamp": 1900.0, "slot": 2, "source": "api", "kc": None, "yield_percentage": 0.77}
     monkeypatch.setattr(trust_engine_module.time, "time", lambda: 2000.0)
 
     def _unexpected_call(url, timeout):
@@ -263,40 +292,103 @@ def test_get_current_forecast_uses_fallback_on_api_error(trust_engine_module, mo
     assert trust_engine_module.forecast_cache["yield_percentage"] == pytest.approx(0.33)
     assert trust_engine_module.forecast_cache["timestamp"] == 2000.0
 
+def test_forecast_tolerance_follows_the_sky(trust_engine_module):
+    te = trust_engine_module
+    assert te.forecast_tolerance(1.0) == pytest.approx(te.TOL_CLEAR)
+    assert te.forecast_tolerance(0.0) == pytest.approx(te.TOL_CLOUDY)
+    assert te.forecast_tolerance(0.5) == pytest.approx((te.TOL_CLEAR + te.TOL_CLOUDY) / 2)
+    assert te.forecast_tolerance(None) == pytest.approx(te.TOL_CLOUDY)  # no reliable sky information
+    assert te.forecast_tolerance(1.1) == pytest.approx(te.TOL_CLEAR)
+
+def test_expected_yield_follows_the_sun_within_the_slot(trust_engine_module, monkeypatch):
+    te = trust_engine_module
+    monkeypatch.setattr(te, "LATITUDE", "38.3125")
+    monkeypatch.setattr(te, "LONGITUDE", "16.0")
+    morning = calendar.timegm((2026, 6, 21, 6, 0, 0))
+    monkeypatch.setattr(te.time, "time", lambda: float(morning))
+    monkeypatch.setattr(te, "get_current_forecast", lambda: 0.3)
+    te.forecast_cache = {"timestamp": morning, "slot": None, "source": "api", "kc": 0.6, "yield_percentage": 0.3}
+
+    # Same sky (kc), higher sun twenty minutes later: the expectation grows with the sun
+    early, kc = te.get_expected_yield(morning)
+    later, _ = te.get_expected_yield(morning + 1200)
+    assert kc == 0.6
+    assert later > early > 0
+    assert early == pytest.approx(0.6 * te.clear_sky_ghi_wm2(te.solar_elevation_deg(morning)) / 1000)
+
+def test_sky_index_is_unknown_with_the_sun_too_low(trust_engine_module, monkeypatch):
+    te = trust_engine_module
+    monkeypatch.setattr(te, "LATITUDE", "38.3125")
+    monkeypatch.setattr(te, "LONGITUDE", "16.0")
+    assert te.sky_index_from_yield(0.01, NIGHT) is None
+    assert te.sky_index_from_yield(0.0, SUMMER_NOON) == 0.0
+    assert te.sky_index_from_yield(0.9, SUMMER_NOON) == pytest.approx(
+        900 / te.clear_sky_ghi_wm2(te.solar_elevation_deg(SUMMER_NOON))
+    )
+
 # --- TEST QUERY FLUX AND STATS ---
 def test_get_node_stats_returns_correct_values(trust_engine_module):
     trust_engine_module.query_api.query_result = [
-        _FakeTable([
-            _FakeRecord("mean", 1450.5),
-            _FakeRecord("stddev", 120.0)
-        ])
+        _FakeTable([_FakeRecord("mean", 1450.5)]),
+        _FakeTable([_FakeRecord("stddev", 120.0)]),
+        _FakeTable([_FakeRecord("count", 30)]),
     ]
     mu, sigma = trust_engine_module.get_node_stats("node-1")
     assert mu == 1450.5
     assert sigma == 120.0
+
+def test_get_node_stats_requires_enough_history(trust_engine_module):
+    trust_engine_module.query_api.query_result = [
+        _FakeTable([_FakeRecord("mean", 1450.5)]),
+        _FakeTable([_FakeRecord("stddev", 120.0)]),
+        _FakeTable([_FakeRecord("count", 3)]),
+    ]
+    assert trust_engine_module.get_node_stats("node-1") == (None, None)
+
+def test_flux_string_escapes_injection(trust_engine_module):
+    assert trust_engine_module._flux_string('a"b\\c${x}') == '"a\\"b\\\\c\\${x}"'
+
+def _neighbor_tables(recent, past):
+    return [
+        _FakeTable([_FakeRecord("recent_mean", value, node_id=node) for node, value in recent.items()]),
+        _FakeTable([_FakeRecord("past_mean", value, node_id=node) for node, value in past.items()]),
+    ]
 
 def test_check_spatial_anomaly_detects_drops(trust_engine_module):
     # A minimum quorum of trusted neighbors is needed
     _insert_device(trust_engine_module, "neighbor-1", trust_score=90.0, status=0)
     _insert_device(trust_engine_module, "neighbor-2", trust_score=85.0, status=0)
     _insert_device(trust_engine_module, "neighbor-3", trust_score=70.0, status=0)
+    past = {"neighbor-1": 1000.0, "neighbor-2": 2000.0, "neighbor-3": 500.0}
 
-    # Case 1: decline confirmed (recent < 85% of past)
-    trust_engine_module.query_api.query_result = [
-        _FakeTable([
-            _FakeRecord("recent_mean", 400.0),
-            _FakeRecord("past_mean", 1000.0)
-        ])
-    ]
+    # Case 1: decline confirmed (recent < 85% of past) on most neighbors
+    trust_engine_module.query_api.query_result = _neighbor_tables(
+        {"neighbor-1": 400.0, "neighbor-2": 900.0, "neighbor-3": 480.0}, past
+    )
     assert trust_engine_module.check_spatial_anomaly("node-1") is True
 
     # Case 2: stable production
-    trust_engine_module.query_api.query_result = [
-        _FakeTable([
-            _FakeRecord("recent_mean", 950.0),
-            _FakeRecord("past_mean", 1000.0)
-        ])
-    ]
+    trust_engine_module.query_api.query_result = _neighbor_tables(
+        {"neighbor-1": 950.0, "neighbor-2": 1990.0, "neighbor-3": 480.0}, past
+    )
+    assert trust_engine_module.check_spatial_anomaly("node-1") is False
+
+    # Case 3: only one neighbor dropped -> no swarm consensus
+    trust_engine_module.query_api.query_result = _neighbor_tables(
+        {"neighbor-1": 100.0, "neighbor-2": 1990.0, "neighbor-3": 480.0}, past
+    )
+    assert trust_engine_module.check_spatial_anomaly("node-1") is False
+
+def test_check_spatial_anomaly_requires_quorum_with_data(trust_engine_module):
+    _insert_device(trust_engine_module, "neighbor-1", trust_score=90.0, status=0)
+    _insert_device(trust_engine_module, "neighbor-2", trust_score=85.0, status=0)
+    _insert_device(trust_engine_module, "neighbor-3", trust_score=70.0, status=0)
+
+    # Registered quorum, but only two neighbors reported in both windows
+    trust_engine_module.query_api.query_result = _neighbor_tables(
+        {"neighbor-1": 100.0, "neighbor-2": 100.0},
+        {"neighbor-1": 1000.0, "neighbor-2": 1000.0},
+    )
     assert trust_engine_module.check_spatial_anomaly("node-1") is False
 
 def test_check_spatial_anomaly_fails_below_quorum(trust_engine_module):
@@ -432,24 +524,24 @@ def test_on_message_temporal_anomaly_scales_with_severity(trust_engine_module, m
 
 def test_on_message_rejects_replay(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.5)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
 
     payload = _create_signed_payload(private_key, "node-test", int(time.time()), 1400.0, seq=5)
     engine.on_message(None, None, _DummyMsg(payload))
 
-    # Replay dello stesso identico messaggio
+    # Replay of the exact same message
     engine.on_message(None, None, _DummyMsg(payload))
 
-    assert len(engine.write_api.calls) == 1  # solo il primo va a segno
+    assert len(engine.write_api.calls) == 1  # only the first one is accepted
 
 def test_on_message_rejects_out_of_order_sequence(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.5)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
 
     msg1 = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1400.0, seq=10))
     engine.on_message(None, None, msg1)
 
-    # seq più basso del precedente: va rifiutato
+    # Lower seq than the previous one: rejected
     msg2 = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1400.0, seq=8))
     engine.on_message(None, None, msg2)
 
@@ -470,133 +562,364 @@ def test_on_message_rejects_missing_sequence(risk_matrix_setup, monkeypatch):
     assert engine.write_api.calls == []
 
 # --- TEST RISK MATRIX AND COMMS ---
+# Fixed clock for the risk-matrix tests: 30 s after the start of a 15-minute window, so that
+# messages a few seconds earlier share the window and moving the clock by +900 s closes it
+CLOCK = {"now": 0.0}
+
 @pytest.fixture
 def risk_matrix_setup(trust_engine_module, monkeypatch):
-    """Setup comune per testare i vari rami della matrice di rischio"""
+    """Common setup for the risk-matrix branches"""
     private_key = ec.generate_private_key(ec.SECP256R1())
     public_key_pem = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
-    
+
     # Peak power = 3000W, starting from trust 90.0 to test self-healing
     _insert_device(trust_engine_module, "node-test", public_key=public_key_pem, trust_score=90.0, status=0, peak_power=3000.0)
-    
+
+    # The sun-position bounds are covered separately with fixed timestamps
+    monkeypatch.setattr(trust_engine_module, "clear_sky_limit", lambda peak, ts: float("inf"))
+    monkeypatch.setattr(trust_engine_module, "physical_production_cap", lambda peak, ts: float("inf"))
+
+    window = trust_engine_module.WINDOW_SECONDS
+    CLOCK["now"] = float(1_800_000_000 - 1_800_000_000 % window + 30)
+    monkeypatch.setattr(trust_engine_module.time, "time", lambda: CLOCK["now"])
+
     return private_key, trust_engine_module
 
-def test_on_message_meteo_valid_triggers_self_healing(risk_matrix_setup, monkeypatch):
+def _send(engine, private_key, production, seq, offset=0):
+    """Signed message from node-test, `offset` seconds from the fixed clock."""
+    payload = _create_signed_payload(private_key, "node-test", int(CLOCK["now"]) + offset, production, seq=seq)
+    engine.on_message(None, None, _DummyMsg(payload))
+
+def _close_window(engine, private_key, production, seq):
+    """Move the clock to the next 15-minute window and send one message there, closing the current one."""
+    CLOCK["now"] += engine.WINDOW_SECONDS
+    _send(engine, private_key, production, seq)
+
+def _trust(engine):
+    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
+        return conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
+
+def test_on_message_meteo_valid_triggers_self_healing_once_per_window(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
-    
-    # Simulates forecast of 0.5 (expected 1500W)
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.5)
-    
-    # Production 1400W (error between the 25%)
+
+    # Clear sky, forecast of 0.5 (expected 1500W, tolerance 10%)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
+
+    _send(engine, private_key, 1400.0, seq=1, offset=-20)
+    _send(engine, private_key, 1400.0, seq=2)
+    assert _trust(engine) == 90.0 # recovery is earned by a clean window, not by each message
+
+    _close_window(engine, private_key, 1400.0, seq=3)
+    assert _trust(engine) == 92.0 # 90.0 + 2.0 (Self-healing)
+    assert len(engine.write_api.calls) == 3
+
+def test_on_message_window_overproduction_applies_penalty(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+
+    # Clear sky, forecast of 0.2 (expected 600W): allowed 600W + 60W band
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.2, 1.0))
+
+    # 2500W for the whole window: a single value could be the sun between clouds, the energy cannot
+    _send(engine, private_key, 2500.0, seq=1, offset=-20)
+    _send(engine, private_key, 2500.0, seq=2)
+    assert _trust(engine) == 90.0
+    assert engine.write_api.calls[-1]["record"].fields["status"] == "above_forecast"
+
+    _close_window(engine, private_key, 600.0, seq=3)
+
+    trust_score, _, _, violations, _ = _node_state(engine)
+    assert trust_score == 75.0 # 90.0 - 15.0, once for the window
+    assert violations == 1
+    assert REGISTRY.get_sample_value("te_penalties_applied_total", {"reason": "window_overproduction"}) == 1.0
+
+def test_on_message_sun_between_clouds_is_not_penalized(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+
+    # Expected 1500W, band 150W: bursts at 2400W balanced by shaded moments at 800W
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
+    for seq, (offset, production) in enumerate([(-40, 1500.0), (-30, 2400.0), (-20, 800.0), (-10, 2400.0), (0, 800.0)], 1):
+        _send(engine, private_key, production, seq=seq, offset=offset)
+
+    _close_window(engine, private_key, 1500.0, seq=6)
+
+    trust_score, _, _, violations, _ = _node_state(engine)
+    assert (trust_score, violations) == (92.0, 0)
+
+def test_on_message_tolerance_is_wider_with_clouds(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+
+    # 1900W against an expected 1500W (+27%): fraud with a clear sky, plausible with clouds
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 0.4))  # tolerance 52%
+    _send(engine, private_key, 1900.0, seq=1, offset=-20)
+    _send(engine, private_key, 1900.0, seq=2)
+
+    # Clear sky from now on (tolerance 10%); 1650W is exactly at the edge, leaving no slack
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
+    _close_window(engine, private_key, 1650.0, seq=3)
+    assert _trust(engine) == 92.0
+
+    _send(engine, private_key, 1900.0, seq=4, offset=10)
+    _send(engine, private_key, 1900.0, seq=5, offset=30)
+    _close_window(engine, private_key, 1650.0, seq=6)
+    assert _trust(engine) == 77.0
+
+def test_on_message_consistent_degradation_is_accepted(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+
+    # Simulates forecast of 0.8 (expected 2400W)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.8, 1.0))
+
+    # Simulates a degraded historic (avg: 1200W, stddev: 50.0)
+    monkeypatch.setattr(engine, "get_node_stats", lambda n: (1200.0, 50.0))
+    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
+
+    # Production 1100W (fails the weather check, but Z-Score = -2.0) -> "ok_degradation"
+    _send(engine, private_key, 1100.0, seq=1)
+
+    assert _trust(engine) == 90.0
+    assert engine.write_api.calls[0]["record"].fields["status"] == "ok_degradation"
+
+def test_on_message_swarm_validation_is_accepted(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+
+    # Simulates forecast of 0.8 (expected 2400W)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.8, 1.0))
+
+    # Simulates an high historical (avg: 2300W, stddev: 100.0)
+    monkeypatch.setattr(engine, "get_node_stats", lambda n: (2300.0, 100.0))
+
+    # Simulates overall decline in the neighborhood
+    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: True)
+
+    # Production 500W (fails weather check, Z-Score = -18.0) -> "ok_neigh"
+    _send(engine, private_key, 500.0, seq=1)
+
+    assert _trust(engine) == 90.0
+    assert engine.write_api.calls[0]["record"].fields["status"] == "ok_neigh"
+
+def _node_state(engine):
+    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
+        return conn.execute(
+            """SELECT trust_score, observation_state, observation_counter, recent_violations, status
+               FROM devices WHERE node_id = 'node-test'"""
+        ).fetchone()
+
+def test_on_message_isolated_drop_is_credited_and_monitored(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+
+    # Simulates forecast of 0.8 (expected 2400W)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.8, 1.0))
+    monkeypatch.setattr(engine, "get_node_stats", lambda n: (2300.0, 100.0))
+
+    # Simulates no decline in the neighborhood
+    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
+
+    # Production 500W (fails weather check, Z-score high, neighborhood stable) -> "local_drop"
+    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 500.0))
+    engine.on_message(None, None, msg)
+
+    trust_score, state, counter, violations, _ = _node_state(engine)
+    assert trust_score == 90.0 # declaring less is never penalized (recovery comes at window close)
+    assert (state, counter, violations) == ("local_anomaly", 1, 0)
+    assert len(engine.write_api.calls) == 1 # credited as declared
+    assert engine.write_api.calls[0]["record"].fields["status"] == "local_drop"
+
+def test_on_message_persistent_local_drop_raises_maintenance_alert(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.8, 1.0))
+    monkeypatch.setattr(engine, "get_node_stats", lambda n: (2300.0, 100.0))
+    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
+    monkeypatch.setattr(engine, "LOCAL_DROP_OBSERVATION_LIMIT", 3)
+
+    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
+        conn.execute(
+            """UPDATE devices SET observation_state = 'local_anomaly', observation_counter = 2,
+               observation_since = datetime('now', '-30 minutes') WHERE node_id = 'node-test'"""
+        )
+        conn.commit()
+
+    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 500.0))
+    engine.on_message(None, None, msg)
+
+    trust_score, state, _, violations, _ = _node_state(engine)
+    assert trust_score == 90.0
+    assert state == "maintenance_suspected"
+    assert violations == 0
+    assert len(engine.write_api.calls) == 1
+    assert REGISTRY.get_sample_value("te_maintenance_alerts_total", {"reason": "local_drop"}) == 1.0
+
+def test_on_message_new_building_shadow_never_bans(risk_matrix_setup, monkeypatch):
+    # A building permanently cuts the production to ~30%: hours of local drops must not ban the node
+    private_key, engine = risk_matrix_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.8, 1.0))  # expected 2400W
+    monkeypatch.setattr(engine, "get_node_stats", lambda n: (2300.0, 50.0))  # history before the building
+    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
+    monkeypatch.setattr(engine, "LOCAL_DROP_OBSERVATION_LIMIT", 3)
+
+    # The building appeared half an hour ago
+    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
+        conn.execute(
+            """UPDATE devices SET observation_state = 'local_anomaly', observation_counter = 0,
+               observation_since = datetime('now', '-30 minutes') WHERE node_id = 'node-test'"""
+        )
+        conn.commit()
+
+    now = int(time.time())
+    for seq in range(1, 41):
+        payload = _create_signed_payload(private_key, "node-test", now - 30 + seq, 700.0, seq=seq)
+        engine.on_message(None, None, _DummyMsg(payload))
+
+    trust_score, state, _, violations, status = _node_state(engine)
+    assert status == 0
+    assert violations == 0
+    assert trust_score == 90.0
+    assert state == "maintenance_suspected"
+    assert len(engine.write_api.calls) == 40
+
+def test_on_message_normal_value_clears_observation(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
+
+    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
+        conn.execute(
+            """UPDATE devices SET observation_state = 'local_anomaly', observation_counter = 5,
+               observation_since = datetime('now', '-3 days') WHERE node_id = 'node-test'"""
+        )
+        conn.commit()
+
     msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1400.0))
     engine.on_message(None, None, msg)
 
     with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
-    
-    assert trust_score == 92.0 # 90.0 + 2.0 (Self-healing)
-    assert len(engine.write_api.calls) == 1
+        state, counter, since = conn.execute(
+            "SELECT observation_state, observation_counter, observation_since FROM devices WHERE node_id = 'node-test'"
+        ).fetchone()
 
-def test_on_message_spoofing_applies_full_penalty(risk_matrix_setup, monkeypatch):
+    assert (state, counter, since) == (None, 0, None)
+
+def test_on_message_low_production_is_credited_without_penalty(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.8, 1.0))  # expected 2400W, floor 240W
 
-    # Simulates forecast of 0.2 (expected 600W)
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.2)
-    monkeypatch.setattr(engine, "get_node_stats", lambda n: (500.0, 50.0))
-    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
-    
-    # Production 2500W -> "overproduction"
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 2500.0))
+    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 100.0))
     engine.on_message(None, None, msg)
+
+    trust_score, state, _, violations, _ = _node_state(engine)
+    assert trust_score == 90.0
+    assert violations == 0
+    assert state == "local_anomaly"
+    assert engine.write_api.calls[0]["record"].fields["status"] == "low_production"
+
+@pytest.mark.parametrize("raw_production", ["NaN", "Infinity", "-5.0"])
+def test_on_message_rejects_non_physical_production(risk_matrix_setup, monkeypatch, raw_production):
+    private_key, engine = risk_matrix_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
+
+    signed = f'{{"node_id":"node-test","timestamp":{int(time.time())},"seq":1,"production":{raw_production}}}'
+    signature = private_key.sign(signed.encode(), ec.ECDSA(hashes.SHA256())).hex()
+    raw = signed[:-1] + f',"sig":"{signature}"}}'
+
+    engine.on_message(None, None, _RawMsg(raw.encode()))
 
     with closing(sqlite3.connect(engine.DB_PATH)) as conn:
         trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
-    
-    assert trust_score == 75.0 # 90.0 - 15.0 (full penalty)
+
+    assert trust_score == 90.0
+    assert engine.write_api.calls == []
+
+def test_on_message_accepts_firmware_payload_and_integrates_energy(risk_matrix_setup, monkeypatch):
+    private_key, engine = risk_matrix_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))  # expected 1500W
+    client = _FakeMqttClient()
+    now = int(time.time())
+
+    def firmware_message(ts, seq, production_str):
+        signed = f'{{"node_id":"node-test","timestamp":{ts},"seq":{seq},"production":{production_str}}}'
+        signature = private_key.sign(signed.encode(), ec.ECDSA(hashes.SHA256())).hex()
+        return signed, _RawMsg((signed[:-1] + f',"sig":"{signature}"}}').encode())
+
+    # First message: no previous timestamp, so nothing is credited on the ledger
+    _, first = firmware_message(now - 10, 1, "1400.50")
+    engine.on_message(client, None, first)
+    assert client.published == []
     assert len(engine.write_api.calls) == 1
 
-def test_on_message_consistent_degradation_triggers_self_healing(risk_matrix_setup, monkeypatch):
+    # Second message, 10 s later, with a trailing zero that Python would re-serialize differently
+    signed, second = firmware_message(now, 2, "1440.00")
+    engine.on_message(client, None, second)
+
+    assert len(engine.write_api.calls) == 2
+    assert len(client.published) == 1
+    topic, transfer = client.published[0]
+    assert topic == engine.TRANSFERS_TOPIC
+    assert transfer["interval_s"] == 10.0
+    assert transfer["power_w"] == 1440.0
+    assert transfer["wh_amount"] == pytest.approx(1440.0 * 10 / 3600)
+    assert transfer["seq"] == 2
+    assert transfer["signed_payload"] == signed
+
+def test_on_message_caps_energy_interval(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
-    
-    # Simulates forecast of 0.8 (expected 2400W)
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.8)
-    
-    # Simulates a degraded historic (avg: 1200W, stddev: 50.0)
-    monkeypatch.setattr(engine, "get_node_stats", lambda n: (1200.0, 50.0))
-    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
-    
-    # Production 1100W (fails the weather check, but Z-Score = -2.0) -> "ok_degraded_profile"
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1100.0))
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
+    monkeypatch.setattr(engine, "MAX_ENERGY_INTERVAL_S", 30.0)
+    client = _FakeMqttClient()
+
+    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
+        conn.execute("UPDATE devices SET last_energy_ts = ? WHERE node_id = 'node-test'", (int(time.time()) - 3600,))
+        conn.commit()
+
+    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1400.0))
+    engine.on_message(client, None, msg)
+
+    assert client.published[0][1]["interval_s"] == 30.0
+
+def test_on_message_unsynced_clock_is_rejected_without_penalty(risk_matrix_setup):
+    private_key, engine = risk_matrix_setup
+
+    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", 0, 1400.0))
     engine.on_message(None, None, msg)
 
     with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
-    
-    assert trust_score == 92.0 # 90.0 + 2.0 (Self-healing perdonato)
-    assert len(engine.write_api.calls) == 1
+        trust_score, violations = conn.execute(
+            "SELECT trust_score, recent_violations FROM devices WHERE node_id = 'node-test'"
+        ).fetchone()
 
-def test_on_message_swarm_validation_triggers_self_healing(risk_matrix_setup, monkeypatch):
+    assert (trust_score, violations) == (90.0, 0)
+    assert engine.write_api.calls == []
+
+def test_on_message_temporal_violation_records_violation_time(risk_matrix_setup):
     private_key, engine = risk_matrix_setup
-    
-    # Simulates forecast of 0.8 (expected 2400W)
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.8)
-    
-    # Simulates an high historical (avg: 2300W, stddev: 100.0)
-    monkeypatch.setattr(engine, "get_node_stats", lambda n: (2300.0, 100.0))
-    
-    # Simulates overall decline in the neighborhood
-    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: True)
-    
-    # Production 500W (fails weather check, Z-Score = -18.0) -> pass thanks to "ok_swarm_validated"
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 500.0))
+
+    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()) - 600, 1400.0))
     engine.on_message(None, None, msg)
 
     with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
-    
-    assert trust_score == 92.0 # 90.0 + 2.0 (Self-healing)
-    assert len(engine.write_api.calls) == 1
+        violations, last_violation = conn.execute(
+            "SELECT recent_violations, last_violation_time FROM devices WHERE node_id = 'node-test'"
+        ).fetchone()
 
-def test_on_message_isolated_drop_applies_half_penalty(risk_matrix_setup, monkeypatch):
-    private_key, engine = risk_matrix_setup
-    
-    # Simulates forecast di 0.8 (expected 2400W)
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.8)
-    monkeypatch.setattr(engine, "get_node_stats", lambda n: (2300.0, 100.0))
-    
-    # Simulates no decline in the neighborhood
-    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
-    
-    # Production 500W (fails weather check, Z-score high, neighborhood stable) -> "isolated_drop"
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 500.0))
-    engine.on_message(None, None, msg)
-
-    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
-    
-    assert trust_score == 82.5 # 90.0 - 7.5 (Half penalty for malfunction or tampering)
-    assert len(engine.write_api.calls) == 1
+    assert violations == 1
+    assert last_violation is not None
 
 def test_on_message_recovery_decays_after_violations(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
 
-    # Il nodo ha già 2 violazioni recenti -> decay_factor = 0.25 -> bonus = 0.5
+    # The node already has 2 recent violations -> decay_factor = 0.25 -> bonus = 0.5
     with closing(sqlite3.connect(engine.DB_PATH)) as conn:
         conn.execute("UPDATE devices SET recent_violations = 2 WHERE node_id = 'node-test'")
         conn.commit()
 
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.5)  # expected 1500W
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))  # expected 1500W
 
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1400.0))
-    engine.on_message(None, None, msg)
+    # Two messages: the window needs a measured interval to earn the recovery
+    _send(engine, private_key, 1400.0, seq=1, offset=-20)
+    _send(engine, private_key, 1400.0, seq=2)
+    _close_window(engine, private_key, 1400.0, seq=3)
 
-    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
-
-    assert trust_score == 90.5  # 90.0 + (2.0 * 0.25) invece di +2.0 pieno
+    assert _trust(engine) == 90.5  # 90.0 + (2.0 * 0.25) instead of the full +2.0
 
 def test_on_message_recovery_bonus_caps_at_max_decay(risk_matrix_setup, monkeypatch):
     private_key, engine = risk_matrix_setup
@@ -606,32 +929,96 @@ def test_on_message_recovery_bonus_caps_at_max_decay(risk_matrix_setup, monkeypa
         conn.execute("UPDATE devices SET recent_violations = 10 WHERE node_id = 'node-test'")
         conn.commit()
 
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.5)
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.5, 1.0))
 
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 1400.0))
-    engine.on_message(None, None, msg)
-
-    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        trust_score = conn.execute("SELECT trust_score FROM devices WHERE node_id = 'node-test'").fetchone()[0]
+    # Two messages: the window needs a measured interval to earn the recovery
+    _send(engine, private_key, 1400.0, seq=1, offset=-20)
+    _send(engine, private_key, 1400.0, seq=2)
+    _close_window(engine, private_key, 1400.0, seq=3)
 
     # decay_factor = 0.5**5 = 0.03125 -> bonus = 0.0625
-    assert trust_score == pytest.approx(90.0625)
+    assert _trust(engine) == pytest.approx(90.0625)
 
-def test_on_message_violations_increment_on_penalty(risk_matrix_setup, monkeypatch):
-    private_key, engine = risk_matrix_setup
+# --- TEST PHYSICAL CAP (SUN POSITION) ---
+SUMMER_NOON = calendar.timegm((2026, 6, 21, 10, 58, 0))   # solar noon at lon 16E
+WINTER_NOON = calendar.timegm((2026, 12, 21, 10, 58, 0))
+WINTER_DUSK = calendar.timegm((2026, 12, 21, 15, 40, 0))  # sun just below the horizon
+NIGHT = calendar.timegm((2026, 6, 21, 0, 0, 0))
 
-    monkeypatch.setattr(engine, "get_current_forecast", lambda: 0.2)  # expected 600W
-    monkeypatch.setattr(engine, "get_node_stats", lambda n: (500.0, 50.0))
-    monkeypatch.setattr(engine, "check_spatial_anomaly", lambda n: False)
+def test_solar_elevation_matches_astronomy(trust_engine_module):
+    te = trust_engine_module
+    # Noon elevation = 90 - latitude +/- 23.44 at the solstices
+    assert te.solar_elevation_deg(SUMMER_NOON, 38.3125, 16.0) == pytest.approx(90 - 38.3125 + 23.44, abs=0.5)
+    assert te.solar_elevation_deg(WINTER_NOON, 38.3125, 16.0) == pytest.approx(90 - 38.3125 - 23.44, abs=0.5)
+    assert te.solar_elevation_deg(NIGHT, 38.3125, 16.0) < -20
 
-    # Overproduction
-    msg = _DummyMsg(_create_signed_payload(private_key, "node-test", int(time.time()), 2500.0))
-    engine.on_message(None, None, msg)
+def test_physical_cap_by_time_of_day(trust_engine_module, monkeypatch):
+    te = trust_engine_module
+    monkeypatch.setattr(te, "LATITUDE", "38.3125")
+    monkeypatch.setattr(te, "LONGITUDE", "16.0")
 
-    with closing(sqlite3.connect(engine.DB_PATH)) as conn:
-        violations = conn.execute("SELECT recent_violations FROM devices WHERE node_id = 'node-test'").fetchone()[0]
+    # Night: only meter noise
+    assert te.physical_production_cap(3000.0, NIGHT) == te.NIGHT_MAX_WATT
+    assert te.clear_sky_limit(3000.0, NIGHT) == 0.0
 
+    # Noon: bounded by the nameplate overload
+    assert te.physical_production_cap(3000.0, SUMMER_NOON) == pytest.approx(3000.0 * te.PEAK_OVERLOAD_RATIO)
+
+    # Twilight: small but non-zero, so an honest meter is not penalized at sunset
+    dusk_cap = te.physical_production_cap(3000.0, WINTER_DUSK)
+    assert te.NIGHT_MAX_WATT < dusk_cap < 150.0
+
+    # The cap grows with the sun
+    assert te.max_irradiance_wm2(5.0) < te.max_irradiance_wm2(30.0) < te.max_irradiance_wm2(70.0)
+
+@pytest.fixture
+def night_setup(trust_engine_module, monkeypatch):
+    """Node at a fixed night instant, with the real sun-position bounds."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    _insert_device(trust_engine_module, "node-test", public_key=public_key_pem, trust_score=90.0, peak_power=3000.0)
+
+    monkeypatch.setattr(trust_engine_module, "LATITUDE", "38.3125")
+    monkeypatch.setattr(trust_engine_module, "LONGITUDE", "16.0")
+    monkeypatch.setattr(trust_engine_module.time, "time", lambda: float(NIGHT))
+    return private_key, trust_engine_module
+
+def test_on_message_night_production_is_penalized(night_setup, monkeypatch):
+    private_key, engine = night_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.0, 1.0))
+
+    # 90W was inside the old 100W night tolerance: now it is above the physical cap
+    engine.on_message(None, None, _DummyMsg(_create_signed_payload(private_key, "node-test", NIGHT, 90.0)))
+
+    trust_score, _, _, violations, _ = _node_state(engine)
+    assert trust_score == 75.0
     assert violations == 1
+    assert engine.write_api.calls == []
+
+def test_on_message_night_meter_noise_is_accepted(night_setup, monkeypatch):
+    private_key, engine = night_setup
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.0, 1.0))
+
+    engine.on_message(None, None, _DummyMsg(_create_signed_payload(private_key, "node-test", NIGHT, 3.0)))
+
+    trust_score, _, _, violations, _ = _node_state(engine)
+    assert (trust_score, violations) == (90.0, 0)
+    assert engine.write_api.calls[0]["record"].fields["status"] == "ok_meteo"
+
+def test_on_message_stale_forecast_after_sunset_is_ignored(night_setup, monkeypatch):
+    private_key, engine = night_setup
+    # The cached forecast still says 10% (300W) but the sun has set: honest 0W is normal
+    monkeypatch.setattr(engine, "get_expected_yield", lambda ts: (0.1, 1.0))
+
+    engine.on_message(None, None, _DummyMsg(_create_signed_payload(private_key, "node-test", NIGHT, 0.0)))
+
+    trust_score, state, _, _, _ = _node_state(engine)
+    assert trust_score == 90.0
+    assert state is None  # no spurious "low_production" anomaly every evening
+    assert engine.write_api.calls[0]["record"].fields["status"] == "ok_meteo"
 
 # --- TEST CONNECTION AND PROTOCOLS ---
 def test_on_connect_subscribes_when_connection_is_ok(trust_engine_module):

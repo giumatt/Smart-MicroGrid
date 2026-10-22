@@ -1,23 +1,22 @@
 #!/bin/bash
-# Script per sbloccare un dispositivo bannato dal Trust Engine
-# Può essere eseguito direttamente o all'interno del container Docker
+# Unban a device banned by the Trust Engine.
+# Can be run on the host or inside the Docker container.
 
 echo "============================================================"
 echo "   Smart MicroGrid - Device Recovery Tool"
 echo "============================================================"
 echo ""
 
-# Determina se siamo in un container o in locale
+# Detect whether we are inside a container or on the host
 if [ -f /.dockerenv ] || [ -n "$DOCKER_CONTAINER" ]; then
-    # Siamo in un container
-    echo "🐳 Esecuzione in ambiente Docker"
+    echo "Running inside Docker"
     python3 /app/src/scripts/unban_device.py
 else
-    # Siamo in locale, usa docker exec
-    echo "💻 Esecuzione da host locale"
+    # On the host: run the script through docker exec
+    echo "💻 Running on the local host"
     echo ""
     
-    # Trova il container del provisioner o trust engine
+    # Find the trust engine (or provisioner) container
     CONTAINER=$(docker ps --filter "name=trust" --format "{{.Names}}" | head -n1)
     
     if [ -z "$CONTAINER" ]; then
@@ -25,22 +24,22 @@ else
     fi
     
     if [ -z "$CONTAINER" ]; then
-        echo "❌ Nessun container attivo trovato per trust_engine o provisioner"
-        echo "   Avvia i container con: cd gateway && docker-compose up -d"
+        echo "No running trust_engine or provisioner container found"
+        echo "   Start the containers with: cd gateway && docker-compose up -d"
         exit 1
     fi
     
-    echo "📦 Usando container: $CONTAINER"
+    echo "Using container: $CONTAINER"
     echo ""
     
-    # Verifica che lo script esista nel container
+    # Check that the script exists in the container
     docker exec "$CONTAINER" test -f /app/src/scripts/unban_device.py
     if [ $? -ne 0 ]; then
-        echo "❌ Script non trovato nel container"
-        echo "   Assicurati di aver montato correttamente la directory src/scripts/"
+        echo "Script not found in the container"
+        echo "   Make sure the src/scripts/ directory is mounted"
         exit 1
     fi
     
-    # Esegui lo script nel container
+    # Run the script in the container
     docker exec -it "$CONTAINER" python3 /app/src/scripts/unban_device.py
 fi

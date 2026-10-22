@@ -62,7 +62,7 @@ def unban_device(node_id, reset_trust=True):
         device = cursor.fetchone()
         
         if not device:
-            print(f"Devide '{node_id}' not found in database,")
+            print(f"Device '{node_id}' not found in database")
             conn.close()
             return False
         
@@ -70,7 +70,7 @@ def unban_device(node_id, reset_trust=True):
         current_trust = device[2]
         
         if current_status == 0:
-            print(f"Device '{node_id}' it's not banned (status=0)")
+            print(f"Device '{node_id}' is not banned (status=0)")
             print(f"    Actual Trust Score: {current_trust:.1f}")
             conn.close()
             return False
@@ -83,7 +83,7 @@ def unban_device(node_id, reset_trust=True):
                 WHERE node_id = ?
             """, (datetime.now(), node_id))
             print(f"Device '{node_id}' unbanned.")
-            print(f"   Status: 1 (banned) → 0 (active)")
+            print("   Status: 1 (banned) → 0 (active)")
             print(f"   Trust score: {current_trust:.1f} → 100.0 (restored)")
         else:
             cursor.execute("""
@@ -92,7 +92,7 @@ def unban_device(node_id, reset_trust=True):
                 WHERE node_id = ?
             """, (datetime.now(), node_id))
             print(f"Device '{node_id}' unbanned,")
-            print(f"   Status: 1 (banned) → 0 (active)")
+            print("   Status: 1 (banned) → 0 (active)")
             print(f"   Trust score retained: {current_trust:.1f}")
         
         conn.commit()
@@ -152,7 +152,7 @@ def main():
     print("Device info:")
     print(f"   Node ID: {device_info[0]}")
     print(f"   Trust score: {device_info[1]:.1f}")
-    print(f"   Status: {device_info[2]} ({'bannato' if device_info[2] == 1 else 'attivo'})")
+    print(f"   Status: {device_info[2]} ({'banned' if device_info[2] == 1 else 'active'})")
     print()
     
     # Trust restoration option
